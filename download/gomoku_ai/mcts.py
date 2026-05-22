@@ -303,11 +303,12 @@ class MCTS:
         return action_probs, root_value
 
     def _standard_search(self, board, root, num_sims):
-        """标准 AlphaZero MCTS (V2: Undo-based + 消除双重推理 + 正确批量)"""
+        """标准 AlphaZero MCTS (V3: 修复批量推理扩展 + root_value)"""
         batch_features = []
         batch_masks = []
         batch_nodes = []
         batch_paths = []
+        batch_boards = []  # V3: 保存 board 快照用于模式注入
 
         for sim in range(num_sims):
             if USE_UNDO_MCTS:
@@ -343,9 +344,9 @@ class MCTS:
                     if board.winner == 0:
                         value = 0.0
                     else:
-                        # 最后一手是赢家下的, 此时 current_player 已经切换
-                        # 但 game_over 时 current_player 未切换 (因为赢了不走 else)
-                        # 所以 winner == current_player (还没切换)
+                        # 最后一手是赢家下的, 此时 current_player 未切换
+                        # value 从落子者(赢家)视角为 +1.0
+                        # 回传时每步取反, 子节点 q_value 从父节点视角正确
                         value = 1.0 if board.winner == board.current_player else -1.0
                     self._backpropagate(path, value)
                 else:
@@ -364,6 +365,7 @@ class MCTS:
                             batch_masks.append(legal_mask)
                             batch_nodes.append(node)
                             batch_paths.append(path)
+                            batch_boards.append((board.board.copy(), board.current_player))
                     else:
                         # 已扩展但需要重新评估
                         feature = board.get_feature_planes()
@@ -374,16 +376,18 @@ class MCTS:
                         batch_masks.append(legal_mask)
                         batch_nodes.append(node)
                         batch_paths.append(path)
+                        batch_boards.append(None)  # 已扩展, 不需要board
 
                     # 批量推理
                     if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
                         if batch_features:
                             self._batch_inference(batch_features, batch_masks,
-                                                  batch_nodes, batch_paths)
+                                                  batch_nodes, batch_paths, batch_boards)
                             batch_features.clear()
                             batch_masks.clear()
                             batch_nodes.clear()
                             batch_paths.clear()
+                            batch_boards.clear()
 
                 # Undo
                 board.restore_state()
@@ -420,6 +424,7 @@ class MCTS:
                             batch_masks.append(legal_mask)
                             batch_nodes.append(node)
                             batch_paths.append(path)
+                            batch_boards.append((sim_board.board.copy(), sim_board.current_player))
                     else:
                         feature = sim_board.get_feature_planes()
                         legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
@@ -429,15 +434,17 @@ class MCTS:
                         batch_masks.append(legal_mask)
                         batch_nodes.append(node)
                         batch_paths.append(path)
+                        batch_boards.append(None)  # 已扩展
 
                     if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
                         if batch_features:
                             self._batch_inference(batch_features, batch_masks,
-                                                  batch_nodes, batch_paths)
+                                                  batch_nodes, batch_paths, batch_boards)
                             batch_features.clear()
                             batch_masks.clear()
                             batch_nodes.clear()
                             batch_paths.clear()
+                            batch_boards.clear()
 
             # 提前终止
             if sim > num_sims // 2 and root.visit_count > 10 and root.children:
@@ -461,7 +468,14 @@ class MCTS:
             for action, prob in zip(actions, probs):
                 action_probs[action] = prob
 
-        root_value = root.q_value
+        # V3 修复: root_value 必须从子节点的 q_value 加权计算
+        # root.q_value 的符号取决于路径奇偶性, 不可靠
+        root_value = 0.0
+        if root.children:
+            total_child_visits = sum(c.visit_count for c in root.children.values())
+            if total_child_visits > 0:
+                root_value = sum(c.visit_count * c.q_value
+                                 for c in root.children.values()) / total_child_visits
         return action_probs, root_value
 
     def _gumbel_search(self, board, root, num_sims):
@@ -561,10 +575,10 @@ class MCTS:
                                         batch_child_nodes.append(node)
                                         batch_paths.append(path)
 
-                # 批量推理
+                # 批量推理 (V3: 传入 None 作为 boards, Gumbel模式下节点已通过 _expand_node 扩展)
                 if batch_features:
                     self._batch_inference(batch_features, batch_masks,
-                                          batch_child_nodes, batch_paths)
+                                          batch_child_nodes, batch_paths, None)
 
                 # 基于访问量淘汰
                 candidate_visits = [(ci, root.children[actions[candidates[ci]]].visit_count)
@@ -660,7 +674,7 @@ class MCTS:
 
         if batch_features:
             self._batch_inference(batch_features, batch_masks,
-                                  batch_child_nodes, batch_paths)
+                                  batch_child_nodes, batch_paths, None)
 
         # 生成动作概率
         action_probs = np.zeros(BOARD_SQUARES, dtype=np.float32)
@@ -678,7 +692,13 @@ class MCTS:
             for action, prob in zip(actions, probs):
                 action_probs[action] = prob
 
-        root_value = root.q_value
+        # V3 修复: root_value 从子节点计算
+        root_value = 0.0
+        if root.children:
+            total_child_visits = sum(c.visit_count for c in root.children.values())
+            if total_child_visits > 0:
+                root_value = sum(c.visit_count * c.q_value
+                                 for c in root.children.values()) / total_child_visits
         return action_probs, root_value
 
     def _root_parallel_search(self, board, root, num_sims):
@@ -700,8 +720,6 @@ class MCTS:
                     child.prior = (1 - DIRICHLET_EPSILON) * child.prior + DIRICHLET_EPSILON * noise[i]
 
             # 在子搜索中使用标准搜索 (不递归 root parallel)
-            old_use_root_parallel = USE_ROOT_PARALLEL
-            # 临时禁用, 避免递归
             action_probs, _ = self._standard_search(board, tree_root, sims_per_tree)
 
             # 合并访问量
@@ -715,26 +733,72 @@ class MCTS:
             for action, v in all_visits.items():
                 action_probs[action] = v / total
 
-        root_value = root.q_value if root.visit_count > 0 else 0.0
+        # V3 修复: 更新 self.root 为最后一棵树的 root, 保持子树复用能力
+        self.root = tree_root
+
+        # V3 修复: 从子节点计算 root_value
+        root_value = 0.0
+        if root.children:
+            total_child_visits = sum(c.visit_count for c in root.children.values())
+            if total_child_visits > 0:
+                root_value = sum(c.visit_count * c.q_value
+                                 for c in root.children.values()) / total_child_visits
         return action_probs, root_value
 
-    def _batch_inference(self, features, masks, nodes, paths):
-        """V2 批量推理: 正确传递 legal_mask"""
+    def _batch_inference(self, features, masks, nodes, paths, boards=None):
+        """V3 修复: 批量推理后必须扩展节点, 否则节点永远不会被扩展"""
         if not features:
             return
 
         batch_size = len(features)
         if batch_size == 1:
-            # 单样本直接推理
-            _, value = self.model.predict(features[0], masks[0])
+            # 单样本直接推理 — V3: 也要扩展节点
+            policy, value = self.model.predict(features[0], masks[0])
+            node = nodes[0]
+            if not node.is_expanded and boards is not None and boards[0] is not None:
+                board_state, current_player = boards[0]
+                self._expand_node_with_policy(node, policy, masks[0], board_state, current_player)
             self._backpropagate(paths[0], float(value))
             return
 
-        # V2 修复: 正确传递 legal_mask
+        # 批量推理
         policies, values = self.model.predictBatch(features, masks)
 
         for i in range(batch_size):
+            node = nodes[i]
+            if not node.is_expanded and boards is not None and boards[i] is not None:
+                board_state, current_player = boards[i]
+                self._expand_node_with_policy(node, policies[i], masks[i], board_state, current_player)
             self._backpropagate(paths[i], float(values[i]))
+
+    def _expand_node_with_policy(self, node, policy, legal_mask, board_state, current_player):
+        """使用已有 policy 扩展节点 (避免重复推理) — V3: 支持模式注入"""
+        if node.is_expanded:
+            return
+
+        legal_indices = np.where(legal_mask > 0.5)[0]
+        if len(legal_indices) == 0:
+            return
+
+        # V3: 模式注入 — 使用保存的 board 快照
+        if USE_PATTERN_INJECTION and board_state is not None:
+            pattern_bonus = compute_pattern_prior_bonus(board_state, current_player)
+            pat_max = pattern_bonus.max()
+            if pat_max > 0:
+                pattern_prior = pattern_bonus / pat_max
+                policy = (1 - PATTERN_INJECTION_WEIGHT) * policy + PATTERN_INJECTION_WEIGHT * pattern_prior
+                policy = policy * legal_mask
+                psum = policy.sum()
+                if psum > 0:
+                    policy /= psum
+
+        # 创建子节点
+        for idx in legal_indices:
+            child = self._alloc_node(parent=node, action=int(idx), prior=policy[idx])
+            node.children[int(idx)] = child
+
+        node.is_expanded = True
+        node.sqrt_N = 0.0
 
     def _select_child(self, node):
         """PUCT 选择 (含 Q-Normalization)"""

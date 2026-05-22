@@ -235,15 +235,8 @@ ZOBRIST_TABLE = _init_zobrist()
 ZOBRIST_TURN = np.int64(0x9E3779B97F4A7C15 & 0x7FFFFFFFFFFFFFFF)
 
 # ======================== 模式查找表 ========================
-def _init_pattern_lookup():
-    """
-    预计算线型模式→棋型映射的查找表
-    用于加速棋型检测: 一次查表替代逐方向分析
-    键: 9-bit 整数 (中心+两侧各4位, 0=空 1=己 2=敌)
-    """
-    # 简化: 使用 (length, open_ends) → pattern_type 映射
-    # 更复杂的查找表可以在后续迭代中加入
-    pass
+# V3 注: _init_pattern_lookup 原为空函数, 已移除
+# 棋型检测通过 vct.py 中的 Numba JIT 函数直接计算
 
 # ======================== 中心距离预计算 ========================
 _CENTER = BOARD_SIZE // 2

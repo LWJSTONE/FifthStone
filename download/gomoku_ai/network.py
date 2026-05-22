@@ -299,7 +299,7 @@ class ONNXInferenceModel:
     def predict(self, feature_planes, legal_mask=None):
         if self.session is None:
             return None, None
-        x = feature_planes.astype(np.float32).unsqueeze(0)
+        x = feature_planes.astype(np.float32)[np.newaxis, ...]  # V3: 修复 numpy 无 unsqueeze
         results = self.session.run(None, {'input': x})
         policy_logits = results[0][0]
         value = results[1][0]

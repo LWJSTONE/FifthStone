@@ -68,6 +68,7 @@ class EMAModel:
     def __init__(self, model, decay=EMA_DECAY):
         self.decay = decay
         self.shadow = {}
+        self._backup = {}  # V3: 备份原始权重, 用于 restore
         for name, param in model.named_parameters():
             self.shadow[name] = param.data.clone()
 
@@ -78,14 +79,18 @@ class EMAModel:
 
     def apply(self, model):
         """将 EMA 权重应用到模型"""
+        # V3: 先备份原始权重
         for name, param in model.named_parameters():
             if name in self.shadow:
+                self._backup[name] = param.data.clone()
                 param.data.copy_(self.shadow[name])
 
     def restore(self, model):
-        """恢复原始权重 (评估后)"""
-        # 需要先保存原始权重
-        pass
+        """V3 修复: 恢复原始权重 (评估后)"""
+        for name, param in model.named_parameters():
+            if name in self._backup:
+                param.data.copy_(self._backup[name])
+        self._backup.clear()
 
 
 class Trainer:
@@ -144,9 +149,6 @@ class Trainer:
         self.history = defaultdict(list)
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-        # V2: 旧策略缓存 (用于 KL 正则)
-        self._old_policy_cache = {}
-
         if resume_path and os.path.exists(resume_path):
             self.load_checkpoint(resume_path)
 
@@ -196,12 +198,12 @@ class Trainer:
             )
             sp_time = time.time() - sp_start
 
-            # V2: 合并回放缓冲区
+            # V3 修复: 合并回放缓冲区 — SumTree 存储的是 (state, policy, value) 样本, 不是 GameData
             if USE_SUMTREE:
-                # SumTree 模式: 逐个添加
-                for game in new_buffer._tree.data[:len(new_buffer)]:
-                    if game is not None:
-                        self.replay_buffer.add_game(game) if hasattr(game, 'is_valid') else None
+                for i in range(len(new_buffer)):
+                    data = new_buffer._tree.data[i]
+                    if data is not None:
+                        self.replay_buffer.add_sample(data)
             else:
                 self.replay_buffer.buffer.extend(new_buffer.buffer)
                 self.replay_buffer.priorities.extend(new_buffer.priorities)
@@ -296,35 +298,21 @@ class Trainer:
 
     def _curriculum_phase(self):
         """
-        V2 修复: 课程学习 — 真正在9×9棋盘上训练
-        临时修改 BOARD_SIZE, 训练后恢复
+        V3 修复: 课程学习 — 由于 Numba JIT 编译时 BOARD_SIZE 已固化,
+        无法在运行时切换 9×9 棋盘. 改为在 15×15 棋盘上使用少量 MCTS 模拟快速预训练.
         """
-        print(f"\n[课程学习] 在 {CURRICULUM_SMALL_SIZE}×{CURRICULUM_SMALL_SIZE} 棋盘上预训练...")
-
-        # 保存原始配置
-        import config
-        orig_board_size = config.BOARD_SIZE
-        orig_board_squares = config.BOARD_SQUARES
-
-        # 临时修改为小棋盘
-        config.BOARD_SIZE = CURRICULUM_SMALL_SIZE
-        config.BOARD_SQUARES = CURRICULUM_SMALL_SIZE * CURRICULUM_SMALL_SIZE
+        print(f"\n[课程学习] 在 15×15 棋盘上快速预训练 (低 MCTS 模拟数)...")
+        print(f"  注意: Numba JIT 编译后 BOARD_SIZE 不可变, 无法切换到 9×9")
 
         for i in range(CURRICULUM_SMALL_ITERS):
             print(f"  课程 {i+1}/{CURRICULUM_SMALL_ITERS}")
-            # 简化: 使用当前棋盘大小训练
-            # 注意: 这需要网络支持可变输入大小, 或者重新创建小棋盘专用网络
-            # 简化实现: 只减少MCTS模拟次数, 在15×15上快速训练
-            game = self_play_game(self.model, num_simulations=NUM_SIMULATIONS // 4)
+            # 使用少量 MCTS 模拟在标准棋盘上快速生成数据
+            game = self_play_game(self.model, num_simulations=max(30, NUM_SIMULATIONS // 4))
             self.replay_buffer.add_game(game)
             if len(self.replay_buffer) >= REPLAY_MIN_SIZE:
                 self._train_step(i)
 
-        # 恢复原始配置
-        config.BOARD_SIZE = orig_board_size
-        config.BOARD_SQUARES = orig_board_squares
-
-        print("[课程学习] 完成, 切换到 15×15 棋盘")
+        print("[课程学习] 预训练完成, 切换到正式训练")
 
     def _train_step(self, iteration):
         """
