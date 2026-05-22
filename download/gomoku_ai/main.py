@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-五子棋 AI 训练系统 — 全面优化版
-================================
+五子棋 AI 训练系统 — V2 全面修复版
+===================================
 用法:
   python main.py train                  # 开始训练
   python main.py train --resume PATH    # 恢复训练
@@ -91,22 +91,24 @@ def run_eval(args):
 
 def run_bench(args):
     print("\n" + "=" * 60)
-    print("  五子棋 AI 性能基准测试 (全面优化版)")
+    print("  五子棋 AI 性能基准测试 (V2)")
     print("=" * 60)
 
     from network import create_model, create_inference_model
-    from board import Board
+    from board import Board, BLACK, WHITE
     from mcts import MCTS
     from vct import find_must_move, vct_search, compute_pattern_prior_bonus
     from config import NUM_SIMULATIONS, INPUT_CHANNELS, BOARD_SIZE, BOARD_SQUARES
+
+    import torch
 
     # 1. 网络推理
     print("\n[1] 网络推理速度")
     model = create_model(device='cpu')
     model.eval()
-    import torch
     x = torch.randn(1, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
 
+    # Warmup
     for _ in range(10):
         with torch.no_grad():
             _ = model(x)
@@ -120,37 +122,46 @@ def run_bench(args):
     print(f"  原始推理: {t/n*1000:.2f} ms/次, {n/t:.0f} 次/秒")
 
     # 推理优化模型
-    opt_model = create_inference_model(model)
-    if opt_model is not model:
-        start = time.time()
-        for _ in range(n):
-            with torch.no_grad():
-                try:
-                    _ = opt_model(x)
-                except Exception:
-                    break
-        t = time.time() - start
-        print(f"  优化推理: {t/n*1000:.2f} ms/次")
+    try:
+        opt_model = create_inference_model(model)
+        if opt_model is not model:
+            for _ in range(5):
+                with torch.no_grad():
+                    try:
+                        _ = opt_model(x)
+                    except Exception:
+                        break
+            start = time.time()
+            for _ in range(n):
+                with torch.no_grad():
+                    try:
+                        _ = opt_model(x)
+                    except Exception:
+                        break
+            t = time.time() - start
+            print(f"  优化推理: {t/n*1000:.2f} ms/次")
+    except Exception as e:
+        print(f"  优化推理: 跳过 ({e})")
 
     # 2. 必走着法检测
     print("\n[2] 必走着法检测速度")
     board = Board()
     board.place_stone(7, 7)
     board.place_stone(7, 8)
-    n = 1000
+    n2 = 1000
     start = time.time()
-    for _ in range(n):
+    for _ in range(n2):
         find_must_move(board.board, board.current_player)
     t = time.time() - start
-    print(f"  {t/n*1e6:.1f} μs/次")
+    print(f"  {t/n2*1e6:.1f} μs/次")
 
     # 3. 模式注入
     print("\n[3] 模式先验计算速度")
     start = time.time()
-    for _ in range(n):
+    for _ in range(n2):
         compute_pattern_prior_bonus(board.board, board.current_player)
     t = time.time() - start
-    print(f"  {t/n*1000:.2f} ms/次")
+    print(f"  {t/n2*1000:.2f} ms/次")
 
     # 4. MCTS (标准)
     print("\n[4] MCTS搜索速度")
@@ -169,13 +180,43 @@ def run_bench(args):
     t = time.time() - start
     print(f"  VCT: {t:.3f}s, 结果: {'找到' if result >= 0 else '未找到'}")
 
-    # 6. 自我对弈
-    print("\n[6] 自我对弈速度 (30次模拟)")
+    # 6. 特征平面计算
+    print("\n[6] 特征平面计算速度 (Numba JIT)")
+    start = time.time()
+    for _ in range(100):
+        board.get_feature_planes()
+    t = time.time() - start
+    print(f"  {t/100*1000:.2f} ms/次")
+
+    # 7. 自我对弈
+    print("\n[7] 自我对弈速度 (30次模拟)")
     from self_play import self_play_game
     start = time.time()
     game = self_play_game(model, num_simulations=30)
     t = time.time() - start
     print(f"  单局: {t:.1f}s, {game.length}步, {t/game.length:.2f}s/步")
+
+    # 8. Board Undo vs Copy
+    print("\n[8] Board Undo vs Copy 速度")
+    board = Board()
+    board.place_stone(7, 7)
+    board.place_stone(7, 8)
+    board.place_stone(6, 6)
+    # Copy
+    start = time.time()
+    for _ in range(10000):
+        b2 = board.copy()
+    t_copy = time.time() - start
+    # Undo
+    start = time.time()
+    for _ in range(10000):
+        board.save_state()
+        board.place_stone(8, 8)
+        board.restore_state()
+    t_undo = time.time() - start
+    print(f"  Board.copy(): {t_copy/10000*1e6:.1f} μs/次")
+    print(f"  save/restore: {t_undo/10000*1e6:.1f} μs/次")
+    print(f"  加速比: {t_copy/t_undo:.2f}×")
 
     print("\n" + "=" * 60)
     print("  基准测试完成")
@@ -183,7 +224,7 @@ def run_bench(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='五子棋 AI (全面优化版)')
+    parser = argparse.ArgumentParser(description='五子棋 AI (V2 全面修复版)')
     sub = parser.add_subparsers(dest='command')
 
     tp = sub.add_parser('train')

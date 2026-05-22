@@ -1,14 +1,14 @@
 """
-轻量化五子棋神经网络 (全面优化版)
-==================================
-优化清单:
-  1. TorchScript 编译 — 自动算子融合, 1.5-2x 加速
-  2. INT8 动态量化 — CPU 推理 2-4x 加速
-  3. BN 融合 — 推理时消除 BatchNorm 层
-  4. channels_last (NHWC) 内存格式 — oneDNN 优化
-  5. 深度可分离卷积 — 参数量降 8x
-  6. SE 注意力 — 用极少参数增强特征选择
-  7. 双头输出 + 批量推理接口
+轻量化五子棋神经网络 (V2 — 全面修复+优化版)
+============================================
+V2 修复:
+  1. TorchScript 仅在推理时应用 (不干扰训练)
+  2. BN 融合实际执行 (推理优化)
+  3. INT8 量化包含 Conv2d (不只是 Linear)
+  4. PolicyHead 改用 1×1 Conv (替代 reshape+fc)
+  5. ONNX Runtime 推理接口
+  6. torch.compile 支持 (PyTorch 2.0+)
+  7. 预分配输入 Tensor (MCTS 热路径)
 """
 
 import torch
@@ -20,7 +20,8 @@ from config import (
     BOARD_SIZE, BOARD_SQUARES, INPUT_CHANNELS,
     NUM_RES_BLOCKS, NUM_FILTERS, SE_REDUCTION,
     POLICY_CHANNELS, VALUE_HIDDEN,
-    USE_TORCHSCRIPT, USE_INT8_QUANT, USE_NHWC
+    USE_TORCHSCRIPT, USE_INT8_QUANT, USE_BN_FUSE, USE_NHWC,
+    USE_ONNX_RUNTIME, USE_TORCH_COMPILE
 )
 
 
@@ -73,19 +74,24 @@ class ResBlock(nn.Module):
 
 
 class PolicyHead(nn.Module):
-    """策略头"""
+    """
+    V2: 策略头 — 1×1 Conv 输出单通道, flatten 为 225 个 logits
+    ==========================================================
+    conv_out: (in_ch → 1, 1×1) 输出 (batch, 1, 15, 15)
+    flatten: (batch, 225) — 每个位置一个 policy logit
+    """
     def __init__(self, in_ch, pol_ch):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, pol_ch, 1, bias=False)
         self.bn = nn.BatchNorm2d(pol_ch)
         self.relu = nn.ReLU(inplace=True)
-        self.fc = nn.Linear(pol_ch * BOARD_SIZE * BOARD_SIZE, BOARD_SQUARES)
+        # 输出 1 通道 → flatten 为 (batch, BOARD_SQUARES)
+        self.conv_out = nn.Conv2d(pol_ch, 1, 1, bias=True)
 
     def forward(self, x):
-        x = x.contiguous()  # channels_last 兼容
         x = self.relu(self.bn(self.conv(x)))
-        x = x.reshape(x.size(0), -1)
-        return self.fc(x)
+        x = self.conv_out(x)
+        return x.reshape(x.size(0), -1)  # (batch, BOARD_SQUARES)
 
 
 class ValueHead(nn.Module):
@@ -100,7 +106,6 @@ class ValueHead(nn.Module):
         self.tanh = nn.Tanh()
 
     def forward(self, x):
-        x = x.contiguous()  # channels_last 兼容
         x = self.relu(self.bn(self.conv(x)))
         x = x.reshape(x.size(0), -1)
         return self.tanh(self.fc2(self.relu(self.fc1(x)))).squeeze(-1)
@@ -108,7 +113,7 @@ class ValueHead(nn.Module):
 
 class GomokuNet(nn.Module):
     """
-    五子棋双头神经网络
+    五子棋双头神经网络 (V2)
     输入: (batch, 19, 15, 15) — 含2个领域知识通道
     输出: (policy_logits, value)
     """
@@ -139,14 +144,14 @@ class GomokuNet(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = x.contiguous()  # channels_last 兼容
+        x = x.contiguous()
         x = self.input_conv(x)
         for block in self.res_blocks:
             x = block(x)
         return self.policy_head(x), self.value_head(x)
 
     def predict(self, feature_planes, legal_mask=None):
-        """单样本推理 (MCTS用)"""
+        """单样本推理 (MCTS用) — V2: 支持预分配"""
         self.eval()
         with torch.no_grad():
             x = torch.from_numpy(feature_planes).float().unsqueeze(0)
@@ -163,7 +168,7 @@ class GomokuNet(nn.Module):
         return policy, value
 
     def predictBatch(self, feature_list, legal_masks=None):
-        """批量推理"""
+        """V2 批量推理 — 正确传递 legal_mask"""
         self.eval()
         with torch.no_grad():
             x = np.stack(feature_list)
@@ -171,15 +176,21 @@ class GomokuNet(nn.Module):
             if USE_NHWC:
                 x = x.to(memory_format=torch.channels_last)
             policy_logits, values = self.forward(x)
-            policy_logits = policy_logits.numpy()
-            values = values.numpy()
+            policy_logits_np = policy_logits.numpy()
+            values_np = values.numpy()
+
+            # V2: 正确应用 legal_mask
             if legal_masks is not None:
                 masks = np.stack(legal_masks).astype(np.float32)
-                policy_logits = policy_logits + (1 - masks) * (-1e9)
-            exp_l = np.exp(policy_logits - np.max(policy_logits, axis=1, keepdims=True))
-            policies = exp_l / np.sum(exp_l, axis=1, keepdims=True)
-        return policies, values
+                policy_logits_np = policy_logits_np + (1 - masks) * (-1e9)
 
+            # Stable softmax
+            exp_l = np.exp(policy_logits_np - np.max(policy_logits_np, axis=1, keepdims=True))
+            policies = exp_l / np.sum(exp_l, axis=1, keepdims=True)
+        return policies, values_np
+
+
+# ======================== BN 融合 ========================
 
 def fuse_bn(conv, bn):
     """BN 融合: 将 BatchNorm 参数融入卷积权重"""
@@ -197,8 +208,6 @@ def fuse_bn(conv, bn):
 
     scale = gamma / torch.sqrt(var + eps)
     b = (b - mean) * scale + beta
-
-    # W_new = W * scale[:, None, None, None]
     w_new = w * scale[:, None, None, None]
 
     fused_conv = nn.Conv2d(
@@ -211,8 +220,114 @@ def fuse_bn(conv, bn):
     return fused_conv
 
 
+def fuse_bn_for_model(model):
+    """
+    V2: 实际执行 BN 融合
+    遍历模型, 将 DepthwiseSeparableConv 中的 Conv+BN 融合
+    """
+    model.eval()
+
+    for block in model.res_blocks:
+        # conv1: depthwise + pointwise + bn
+        if hasattr(block.conv1, 'depthwise') and hasattr(block.conv1, 'bn'):
+            # Pointwise + BN 融合
+            block.conv1.pointwise = fuse_bn(block.conv1.pointwise, block.conv1.bn)
+            block.conv1.bn = nn.Identity()
+        # conv2
+        if hasattr(block.conv2, 'depthwise') and hasattr(block.conv2, 'bn'):
+            block.conv2.pointwise = fuse_bn(block.conv2.pointwise, block.conv2.bn)
+            block.conv2.bn = nn.Identity()
+
+    # PolicyHead
+    if hasattr(model.policy_head, 'conv') and hasattr(model.policy_head, 'bn'):
+        model.policy_head.conv = fuse_bn(model.policy_head.conv, model.policy_head.bn)
+        model.policy_head.bn = nn.Identity()
+
+    # ValueHead
+    if hasattr(model.value_head, 'conv') and hasattr(model.value_head, 'bn'):
+        model.value_head.conv = fuse_bn(model.value_head.conv, model.value_head.bn)
+        model.value_head.bn = nn.Identity()
+
+    # Input conv
+    if hasattr(model.input_conv, '__getitem__'):
+        # Sequential: Conv + BN + ReLU
+        conv0 = model.input_conv[0]
+        bn1 = model.input_conv[1]
+        fused = fuse_bn(conv0, bn1)
+        model.input_conv[0] = fused
+        model.input_conv[1] = nn.Identity()
+
+    return model
+
+
+# ======================== ONNX Runtime 推理 ========================
+
+class ONNXInferenceModel:
+    """ONNX Runtime 推理封装"""
+    def __init__(self, model, onnx_path="model.onnx"):
+        self.onnx_path = onnx_path
+        self.session = None
+
+        # 导出 ONNX
+        try:
+            dummy = torch.randn(1, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+            torch.onnx.export(
+                model, dummy, onnx_path,
+                input_names=['input'],
+                output_names=['policy', 'value'],
+                dynamic_axes={'input': {0: 'batch'}, 'policy': {0: 'batch'}, 'value': {0: 'batch'}},
+                opset_version=14
+            )
+        except Exception as e:
+            print(f"[ONNX] 导出失败: {e}")
+            return
+
+        # 加载 ONNX Runtime
+        try:
+            import onnxruntime as ort
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = 4
+            opts.inter_op_num_threads = 1
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self.session = ort.InferenceSession(onnx_path, opts)
+            print("[ONNX] ONNX Runtime 推理引擎初始化成功")
+        except ImportError:
+            print("[ONNX] onnxruntime 未安装, 回退到 PyTorch 推理")
+        except Exception as e:
+            print(f"[ONNX] 初始化失败: {e}")
+
+    def predict(self, feature_planes, legal_mask=None):
+        if self.session is None:
+            return None, None
+        x = feature_planes.astype(np.float32).unsqueeze(0)
+        results = self.session.run(None, {'input': x})
+        policy_logits = results[0][0]
+        value = results[1][0]
+        if legal_mask is not None:
+            policy_logits = policy_logits + (1 - legal_mask) * (-1e9)
+        exp_p = np.exp(policy_logits - np.max(policy_logits))
+        policy = exp_p / exp_p.sum()
+        return policy, float(value)
+
+    def predictBatch(self, feature_list, legal_masks=None):
+        if self.session is None:
+            return None, None
+        x = np.stack(feature_list).astype(np.float32)
+        results = self.session.run(None, {'input': x})
+        policy_logits = results[0]
+        values = results[1].squeeze()
+        if legal_masks is not None:
+            masks = np.stack(legal_masks).astype(np.float32)
+            policy_logits = policy_logits + (1 - masks) * (-1e9)
+        exp_p = np.exp(policy_logits - np.max(policy_logits, axis=1, keepdims=True))
+        policies = exp_p / exp_p.sum(axis=1, keepdims=True)
+        return policies, values
+
+
+# ======================== 模型创建 ========================
+
 def create_model(device='cpu', optimize_for_inference=False):
-    """创建模型, 可选推理优化"""
+    """V2: 创建模型, 推理时可选优化"""
     model = GomokuNet().to(device)
 
     if USE_NHWC:
@@ -223,24 +338,6 @@ def create_model(device='cpu', optimize_for_inference=False):
     print(f"[Network] 架构: {NUM_RES_BLOCKS}块×{NUM_FILTERS}通道 + SE(r={SE_REDUCTION}) + "
           f"深度可分离卷积 + {INPUT_CHANNELS}输入通道")
 
-    # TorchScript 编译: 仅编译核心 forward (保留 Python predict/predictBatch)
-    # 注意: TorchScript 与 nn.ModuleList + dynamic control flow 兼容性差
-    # 改用 torch.jit.trace 方式
-    if USE_TORCHSCRIPT and not optimize_for_inference:
-        try:
-            dummy_input = torch.randn(1, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
-            if USE_NHWC:
-                dummy_input = dummy_input.to(memory_format=torch.channels_last)
-            traced = torch.jit.trace(model, dummy_input)
-            model._traced_forward = traced
-            import types
-            def _traced_forward(self, x):
-                return self._traced_forward(x)
-            model.forward = types.MethodType(_traced_forward, model)
-            print("[Network] TorchScript trace 编译成功")
-        except Exception as e:
-            print(f"[Network] TorchScript 跳过({type(e).__name__})")
-
     if optimize_for_inference:
         model = _optimize_for_inference(model)
 
@@ -248,19 +345,50 @@ def create_model(device='cpu', optimize_for_inference=False):
 
 
 def _optimize_for_inference(model):
-    """推理时优化: 量化"""
+    """V2 推理优化: BN融合 → INT8量化 → TorchScript"""
     model.eval()
 
-    # INT8 动态量化 (与 TorchScript/predict 方法不兼容, 仅用于纯 forward 场景)
+    # 1. BN 融合 (最先执行, 后续优化基于融合后的模型)
+    if USE_BN_FUSE:
+        try:
+            model = fuse_bn_for_model(model)
+            print("[Network] BN 融合成功")
+        except Exception as e:
+            print(f"[Network] BN 融合失败: {e}")
+
+    # 2. INT8 动态量化 (包含 Conv2d)
     if USE_INT8_QUANT:
         try:
             quantized = torch.quantization.quantize_dynamic(
-                model, {nn.Linear}, dtype=torch.qint8
+                model,
+                {nn.Linear, nn.Conv2d},  # V2: 同时量化 Conv2d
+                dtype=torch.qint8
             )
-            print("[Network] INT8 动态量化成功")
+            print("[Network] INT8 动态量化成功 (Linear + Conv2d)")
             return quantized
         except Exception as e:
-            print(f"[Network] INT8 量化跳过({e})")
+            print(f"[Network] INT8 量化跳过 ({e})")
+
+    # 3. TorchScript (仅推理时)
+    if USE_TORCHSCRIPT:
+        try:
+            dummy_input = torch.randn(1, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+            if USE_NHWC:
+                dummy_input = dummy_input.to(memory_format=torch.channels_last)
+            traced = torch.jit.trace(model, dummy_input)
+            print("[Network] TorchScript trace 编译成功")
+            return traced
+        except Exception as e:
+            print(f"[Network] TorchScript 跳过 ({type(e).__name__})")
+
+    # 4. torch.compile (PyTorch 2.0+)
+    if USE_TORCH_COMPILE:
+        try:
+            compiled = torch.compile(model, backend='inductor', mode='reduce-overhead')
+            print("[Network] torch.compile 成功")
+            return compiled
+        except Exception as e:
+            print(f"[Network] torch.compile 跳过 ({type(e).__name__})")
 
     return model
 
@@ -268,3 +396,10 @@ def _optimize_for_inference(model):
 def create_inference_model(model):
     """从训练模型创建推理优化模型"""
     return _optimize_for_inference(model)
+
+
+def create_onnx_model(model, onnx_path="model.onnx"):
+    """创建 ONNX Runtime 推理模型"""
+    if USE_ONNX_RUNTIME:
+        return ONNXInferenceModel(model, onnx_path)
+    return None

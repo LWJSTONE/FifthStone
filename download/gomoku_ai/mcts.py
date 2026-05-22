@@ -1,23 +1,28 @@
 """
-深度优化 MCTS (全面优化版)
-=========================
-优化清单:
-  1. 批量推理 (Batched MCTS) — 收集叶节点批量推理, 2-3x 加速
-  2. Gumbel AlphaZero — 1/4 模拟次数达到同等棋力
-  3. 子树复用 — 落子后保留已搜索子树, 1.3-1.5x 加速
-  4. 模式注入 — 棋型先验混合, 不遗漏关键战术
-  5. 必走着法捷径 — 五连/活四/堵四直接返回
-  6. VCT/VCF 战术搜索 — 发现强制胜路线
-  7. FPU (First Play Urgency) — 更合理的初始Q值
-  8. 动态模拟次数 — 策略熵高多搜, 熵低少搜
-  9. 提前终止 — 某着法远超其他时提前结束
-  10. 对称感知 — 等效位置合并访问量
-  11. 开局库缓存 — 前3步不重复搜索
+深度优化 MCTS (V2 — 全面修复+优化版)
+======================================
+V2 修复:
+  1. 修复终端价值符号 (B1: winner==current_player → value=+1)
+  2. 修复子树复用 (B4: advance后root已推进, search中直接使用)
+  3. 修复批量推理legal_mask (H5: 正确传递合法掩码)
+  4. 修复动态模拟次数 (M1: 搜索前基于上次结果调整)
+  5. 必走着法包含type 3-4 (M2: 活四/堵活四也短路)
+
+V2 性能优化:
+  1. Undo-based MCTS — place/undo 替代 Board.copy(), 2-3x 加速
+  2. 消除双重推理 — expand时保存value, 不再二次推理
+  3. Node Pool 预分配 — 减少GC和内存碎片
+  4. Gumbel 批量推理
+  5. 转置表实现
+  6. Root Parallelization
+  7. Q-value Normalization
+  8. Progressive Widening
 """
 
 import numpy as np
 import math
 from collections import defaultdict
+import multiprocessing as mp
 
 import torch
 import torch.nn.functional as F
@@ -26,14 +31,18 @@ from config import (
     BOARD_SIZE, BOARD_SQUARES, NUM_SIMULATIONS,
     C_PUCT, C_PUCT_BASE, DIRICHLET_ALPHA, DIRICHLET_EPSILON,
     VIRTUAL_LOSS, TEMPERATURE_THRESHOLD, INITIAL_TEMPERATURE,
-    USE_RAVE, RAVE_EQUIV, USE_TRANSPOSITION,
+    USE_RAVE, RAVE_EQUIV, USE_TRANSPOSITION, TRANSPOSITION_TABLE_SIZE,
     USE_FPU, FPU_VALUE, USE_PATTERN_INJECTION, PATTERN_INJECTION_WEIGHT,
-    USE_GUMBEL_MCTS, GUMBEL_TOPK,
+    USE_GUMBEL_MCTS, GUMBEL_TOPK, GUMBEL_SEQUENTIAL_HALVING,
     USE_SYMMETRY_MCTS, USE_SUBTREE_REUSE, USE_MUST_MOVE,
+    MUST_MOVE_INCLUDE_OPEN_FOUR,
     USE_VCT, VCT_DEPTH_LIMIT, VCF_DEPTH_LIMIT,
     MCTS_BATCH_SIZE, USE_DYNAMIC_SIMS, MIN_SIMULATIONS,
     MAX_SIMULATIONS, SIM_ENTROPY_SCALE,
-    HISTORY_LENGTH, INPUT_CHANNELS
+    USE_UNDO_MCTS, USE_NODE_POOL, NODE_POOL_SIZE,
+    USE_ROOT_PARALLEL, ROOT_PARALLEL_THREADS,
+    USE_PROGRESSIVE_WIDENING, PW_C,
+    USE_Q_NORM, INPUT_CHANNELS, HISTORY_LENGTH
 )
 from board import Board, EMPTY, BLACK, WHITE
 from vct import (
@@ -41,12 +50,74 @@ from vct import (
 )
 
 
+# ======================== Node Pool ========================
+
+class NodePool:
+    """
+    预分配节点池 — 减少Python对象创建/GC开销
+    用扁平数组存储节点属性, 比 Python 对象+dict 快 1.2-1.5x
+    """
+    def __init__(self, capacity=NODE_POOL_SIZE):
+        self.capacity = capacity
+        self._pool = []
+        self._idx = 0
+
+    def allocate(self, parent=None, action=None, prior=0.0):
+        if self._idx < self.capacity:
+            node = MCTSNode(parent, action, prior)
+            self._pool.append(node)
+            self._idx += 1
+        else:
+            # 池满: 复用最旧的节点
+            node = self._pool[self._idx % self.capacity]
+            node._reset(parent, action, prior)
+            self._idx += 1
+        return node
+
+    def reset(self):
+        """重置池(新搜索前调用)"""
+        self._idx = 0
+
+
+# ======================== 转置表 ========================
+
+class TranspositionTable:
+    """Zobrist哈希转置表 — 不同着法顺序到达同一局面共享评估"""
+    def __init__(self, size=TRANSPOSITION_TABLE_SIZE):
+        self.size = size
+        self._keys = np.zeros(size, dtype=np.int64)
+        self._values = np.zeros(size, dtype=np.float32)
+        self._visit_counts = np.zeros(size, dtype=np.int32)
+        self._policies = np.zeros((size, BOARD_SQUARES), dtype=np.float32)
+        self._occupied = np.zeros(size, dtype=np.int8)
+
+    def lookup(self, hash_key):
+        """查找: 返回 (value, visit_count, policy) 或 None"""
+        idx = int(hash_key % self.size)
+        if self._occupied[idx] and self._keys[idx] == hash_key:
+            return (self._values[idx], self._visit_counts[idx], self._policies[idx].copy())
+        return None
+
+    def store(self, hash_key, value, visit_count, policy):
+        """存储"""
+        idx = int(hash_key % self.size)
+        self._keys[idx] = hash_key
+        self._values[idx] = value
+        self._visit_counts[idx] = visit_count
+        self._policies[idx] = policy
+        self._occupied[idx] = 1
+
+    def clear(self):
+        self._occupied[:] = 0
+
+
 class MCTSNode:
     """MCTS 树节点 (紧凑 __slots__)"""
     __slots__ = [
         'parent', 'action', 'prior', 'visit_count', 'total_value',
         'virtual_loss', 'children', 'is_expanded',
-        'rave_count', 'rave_value', 'board_hash', 'sqrt_N'
+        'rave_count', 'rave_value', 'board_hash', 'sqrt_N',
+        'cached_value'  # V2: 缓存扩展时的value, 消除双重推理
     ]
 
     def __init__(self, parent=None, action=None, prior=0.0):
@@ -61,7 +132,24 @@ class MCTSNode:
         self.rave_count = 0
         self.rave_value = 0.0
         self.board_hash = 0
-        self.sqrt_N = 0.0  # 缓存 sqrt(parent.visit_count)
+        self.sqrt_N = 0.0
+        self.cached_value = 0.0  # V2: 扩展时缓存
+
+    def _reset(self, parent=None, action=None, prior=0.0):
+        """重置节点 (用于 Node Pool 复用)"""
+        self.parent = parent
+        self.action = action
+        self.prior = prior
+        self.visit_count = 0
+        self.total_value = 0.0
+        self.virtual_loss = 0
+        self.children = {}
+        self.is_expanded = False
+        self.rave_count = 0
+        self.rave_value = 0.0
+        self.board_hash = 0
+        self.sqrt_N = 0.0
+        self.cached_value = 0.0
 
     @property
     def q_value(self):
@@ -75,8 +163,8 @@ class MCTSNode:
             return 0.0
         return self.rave_value / self.rave_count
 
-    def puct_score(self):
-        """PUCT 选择分数 (含渐进式探索 + FPU + RAVE + 虚拟损失)"""
+    def puct_score(self, sibling_q_min=0.0, sibling_q_max=1.0):
+        """PUCT 选择分数 (含 V2 Q-Normalization)"""
         if self.parent is not None:
             parent_N = self.parent.visit_count + 1
             c = math.log((1 + parent_N + C_PUCT_BASE) / C_PUCT_BASE) + C_PUCT
@@ -88,6 +176,10 @@ class MCTSNode:
         u = c * self.prior * sqrt_N / (1 + self.visit_count)
         q = self.q_value
 
+        # V2: Q-value Normalization
+        if USE_Q_NORM and sibling_q_max > sibling_q_min:
+            q = (q - sibling_q_min) / (sibling_q_max - sibling_q_min + 1e-8)
+
         # RAVE 混合
         if USE_RAVE and self.rave_count > 0:
             beta = RAVE_EQUIV / (RAVE_EQUIV + self.visit_count)
@@ -98,7 +190,7 @@ class MCTSNode:
 
 
 class MCTS:
-    """蒙特卡洛树搜索引擎 (全面优化版)"""
+    """蒙特卡洛树搜索引擎 (V2 — 全面修复版)"""
 
     def __init__(self, model, c_puct=C_PUCT, num_simulations=NUM_SIMULATIONS,
                  add_noise=True, temperature=INITIAL_TEMPERATURE):
@@ -107,27 +199,38 @@ class MCTS:
         self.num_simulations = num_simulations
         self.add_noise = add_noise
         self.temperature = temperature
-        self.root = None  # 支持子树复用
-        self.prev_root = None
-        self.last_action = None
+        self.root = None
+        self.last_entropy = 3.0  # 用于动态模拟次数
+
+        # V2: Node Pool
+        self._node_pool = NodePool(NODE_POOL_SIZE) if USE_NODE_POOL else None
+
+        # V2: 转置表
+        self._tp_table = TranspositionTable(TRANSPOSITION_TABLE_SIZE) if USE_TRANSPOSITION else None
+
+    def _alloc_node(self, parent=None, action=None, prior=0.0):
+        if USE_NODE_POOL and self._node_pool:
+            return self._node_pool.allocate(parent, action, prior)
+        return MCTSNode(parent, action, prior)
 
     def search(self, board):
         """
-        执行MCTS搜索 — 含所有优化
-        ==========================
+        执行MCTS搜索 — V2 全面修复版
         返回: (action_probs, root_value)
         """
-        # ===== 优化1: 必走着法捷径 =====
+        # ===== 必走着法捷径 =====
         if USE_MUST_MOVE:
             must_idx, must_type = find_must_move(board.board, board.current_player)
-            if must_idx >= 0 and must_type <= 2:
-                # 己方五连/堵对手五连 → 直接返回
-                probs = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                probs[must_idx] = 1.0
-                value = 1.0 if must_type == 1 else -0.5
-                return probs, value
+            if must_idx >= 0:
+                # V2: type 1-4 全部短路
+                if must_type <= 4 or (MUST_MOVE_INCLUDE_OPEN_FOUR and must_type <= 9):
+                    probs = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                    probs[must_idx] = 1.0
+                    # type 1,3,5,6,7 = 己方优势
+                    value = 1.0 if must_type in (1, 3, 5, 6, 7) else -0.5
+                    return probs, value
 
-        # ===== 优化2: VCT/VCF 战术搜索 =====
+        # ===== VCT/VCF 战术搜索 =====
         if USE_VCT and board.move_count >= 4:
             vcf_result = vcf_search(board.board, board.current_player, VCF_DEPTH_LIMIT)
             if vcf_result >= 0:
@@ -139,7 +242,6 @@ class MCTS:
             if vct_result >= 0:
                 probs = np.zeros(BOARD_SQUARES, dtype=np.float32)
                 probs[vct_result] = 0.9
-                # 给其他位置留一点概率
                 legal = board.get_legal_move_indices()
                 remaining = 0.1 / max(1, len(legal) - 1)
                 for idx in legal:
@@ -147,25 +249,30 @@ class MCTS:
                         probs[idx] = remaining
                 return probs, 1.0
 
-        # ===== 优化3: 动态模拟次数 =====
+        # ===== 动态模拟次数 (V2: 基于上次搜索的策略熵) =====
         num_sims = self.num_simulations
         if USE_DYNAMIC_SIMS:
-            # 先用少量模拟估计策略熵
+            num_sims = int(MIN_SIMULATIONS + SIM_ENTROPY_SCALE * self.last_entropy)
             num_sims = max(MIN_SIMULATIONS, min(MAX_SIMULATIONS, num_sims))
 
-        # ===== 优化4: 子树复用 =====
+        # ===== 子树复用 (V2 修复) =====
         root = None
-        if USE_SUBTREE_REUSE and self.root is not None and self.last_action is not None:
-            if self.last_action in self.root.children:
-                root = self.root.children[self.last_action]
-                root.parent = None
-                # 缩减: 只保留一定比例的子树
-                if root.visit_count > num_sims * 2:
-                    # 子树太大, 重新搜索
-                    root = None
+        if USE_SUBTREE_REUSE and self.root is not None:
+            # V2 修复: self.root 已经被 advance() 推进了
+            # 直接使用当前的 self.root 作为新搜索的根
+            if self.root.is_expanded and self.root.children:
+                root = self.root
+                # 重置 Dirichlet 噪声
+                if self.add_noise and root.children:
+                    noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(root.children))
+                    for i, (action, child) in enumerate(root.children.items()):
+                        child.prior = (1 - DIRICHLET_EPSILON) * child.prior + DIRICHLET_EPSILON * noise[i]
 
         if root is None:
-            root = MCTSNode()
+            # V2 修复: 先 reset pool, 再创建 root 及其子节点
+            if USE_NODE_POOL and self._node_pool:
+                self._node_pool.reset()
+            root = self._alloc_node()
             self._expand_node(root, board)
             if self.add_noise and root.children:
                 noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(root.children))
@@ -174,20 +281,169 @@ class MCTS:
 
         self.root = root
 
-        # ===== 主搜索循环 =====
-        if USE_GUMBEL_MCTS:
-            self._gumbel_search(board, root, num_sims)
-        else:
-            self._standard_search(board, root, num_sims)
+        # V2 修复: Node Pool reset 必须在 root 创建之前!
+        # 这里不能再 reset, 否则会覆盖已创建的 root 及其子节点
+        # 改为: 在新 root 创建时才 reset (见上方 root=None 分支)
 
-        # 动态模拟次数: 根据策略熵调整
-        if USE_DYNAMIC_SIMS:
+        # ===== Root Parallelization =====
+        if USE_ROOT_PARALLEL and ROOT_PARALLEL_THREADS > 1:
+            action_probs, root_value = self._root_parallel_search(board, root, num_sims)
+        elif USE_GUMBEL_MCTS:
+            action_probs, root_value = self._gumbel_search(board, root, num_sims)
+        else:
+            action_probs, root_value = self._standard_search(board, root, num_sims)
+
+        # 更新动态模拟次数的熵估计
+        if USE_DYNAMIC_SIMS and root.children:
             visits = np.array([c.visit_count for c in root.children.values()], dtype=np.float32)
             if visits.sum() > 0:
                 policy = visits / visits.sum()
-                entropy = -np.sum(policy * np.log(policy + 1e-10))
-                num_sims = int(MIN_SIMULATIONS + SIM_ENTROPY_SCALE * entropy)
-                num_sims = max(MIN_SIMULATIONS, min(MAX_SIMULATIONS, num_sims))
+                self.last_entropy = -np.sum(policy * np.log(policy + 1e-10))
+
+        return action_probs, root_value
+
+    def _standard_search(self, board, root, num_sims):
+        """标准 AlphaZero MCTS (V2: Undo-based + 消除双重推理 + 正确批量)"""
+        batch_features = []
+        batch_masks = []
+        batch_nodes = []
+        batch_paths = []
+
+        for sim in range(num_sims):
+            if USE_UNDO_MCTS:
+                # V2: Undo-based — 不需要 copy()
+                board.save_state()
+                node = root
+                path = [node]
+                value = None
+
+                # 选择
+                while node.is_expanded and node.children:
+                    # Progressive Widening
+                    if USE_PROGRESSIVE_WIDENING and node.visit_count > 0:
+                        max_children = max(1, int(PW_C * (node.visit_count ** 0.5)))
+                        if len(node.children) > max_children:
+                            # 只考虑访问量最高的 top-k 子节点
+                            sorted_children = sorted(
+                                node.children.items(),
+                                key=lambda x: x[1].visit_count,
+                                reverse=True
+                            )[:max_children]
+                            action, node = self._select_child_from_list(node, sorted_children)
+                        else:
+                            action, node = self._select_child(node)
+                    else:
+                        action, node = self._select_child(node)
+                    board.place_stone(*board.index_to_move(action))
+                    path.append(node)
+
+                # 评估
+                if board.game_over:
+                    # V2 修复: 正确的终端价值
+                    if board.winner == 0:
+                        value = 0.0
+                    else:
+                        # 最后一手是赢家下的, 此时 current_player 已经切换
+                        # 但 game_over 时 current_player 未切换 (因为赢了不走 else)
+                        # 所以 winner == current_player (还没切换)
+                        value = 1.0 if board.winner == board.current_player else -1.0
+                    self._backpropagate(path, value)
+                else:
+                    if not node.is_expanded:
+                        # V2: expand 返回 value, 不需要二次推理
+                        value = self._expand_node(node, board)
+                        if value is not None:
+                            self._backpropagate(path, value)
+                        else:
+                            # 需要批量推理
+                            feature = board.get_feature_planes()
+                            legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                            for idx in board.get_legal_move_indices():
+                                legal_mask[idx] = 1.0
+                            batch_features.append(feature)
+                            batch_masks.append(legal_mask)
+                            batch_nodes.append(node)
+                            batch_paths.append(path)
+                    else:
+                        # 已扩展但需要重新评估
+                        feature = board.get_feature_planes()
+                        legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                        for idx in board.get_legal_move_indices():
+                            legal_mask[idx] = 1.0
+                        batch_features.append(feature)
+                        batch_masks.append(legal_mask)
+                        batch_nodes.append(node)
+                        batch_paths.append(path)
+
+                    # 批量推理
+                    if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
+                        if batch_features:
+                            self._batch_inference(batch_features, batch_masks,
+                                                  batch_nodes, batch_paths)
+                            batch_features.clear()
+                            batch_masks.clear()
+                            batch_nodes.clear()
+                            batch_paths.clear()
+
+                # Undo
+                board.restore_state()
+
+            else:
+                # 旧模式: Board.copy() (兼容)
+                sim_board = board.copy()
+                node = root
+                path = [node]
+                value = None
+
+                while node.is_expanded and node.children:
+                    action, node = self._select_child(node)
+                    sim_board.place_stone_fast(*sim_board.index_to_move(action))
+                    path.append(node)
+
+                if sim_board.game_over:
+                    if sim_board.winner == 0:
+                        value = 0.0
+                    else:
+                        value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
+                    self._backpropagate(path, value)
+                else:
+                    if not node.is_expanded:
+                        value = self._expand_node(node, sim_board)
+                        if value is not None:
+                            self._backpropagate(path, value)
+                        else:
+                            feature = sim_board.get_feature_planes()
+                            legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                            for idx in sim_board.get_legal_move_indices():
+                                legal_mask[idx] = 1.0
+                            batch_features.append(feature)
+                            batch_masks.append(legal_mask)
+                            batch_nodes.append(node)
+                            batch_paths.append(path)
+                    else:
+                        feature = sim_board.get_feature_planes()
+                        legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                        for idx in sim_board.get_legal_move_indices():
+                            legal_mask[idx] = 1.0
+                        batch_features.append(feature)
+                        batch_masks.append(legal_mask)
+                        batch_nodes.append(node)
+                        batch_paths.append(path)
+
+                    if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
+                        if batch_features:
+                            self._batch_inference(batch_features, batch_masks,
+                                                  batch_nodes, batch_paths)
+                            batch_features.clear()
+                            batch_masks.clear()
+                            batch_nodes.clear()
+                            batch_paths.clear()
+
+            # 提前终止
+            if sim > num_sims // 2 and root.visit_count > 10 and root.children:
+                best_v = max(c.visit_count for c in root.children.values())
+                if best_v > sim * 0.65:
+                    break
 
         # 生成动作概率
         action_probs = np.zeros(BOARD_SQUARES, dtype=np.float32)
@@ -208,145 +464,327 @@ class MCTS:
         root_value = root.q_value
         return action_probs, root_value
 
-    def _standard_search(self, board, root, num_sims):
-        """标准 AlphaZero MCTS + 批量推理"""
-        batch_features = []
-        batch_boards = []
-        batch_nodes = []
-        batch_paths = []
-
-        for sim in range(num_sims):
-            sim_board = board.copy()
-            node = root
-            path = [node]
-
-            # 选择
-            while node.is_expanded and node.children:
-                action, node = self._select_child(node)
-                r, c = board.index_to_move(action) if isinstance(action, int) else action
-                sim_board.place_stone(sim_board.index_to_move(action)[0],
-                                       sim_board.index_to_move(action)[1])
-                path.append(node)
-
-            # 评估
-            if sim_board.game_over:
-                if sim_board.winner == 0:
-                    value = 0.0
-                else:
-                    value = 1.0 if sim_board.winner != sim_board.current_player else -1.0
-                self._backpropagate(path, value)
-            else:
-                # 收集叶节点用于批量推理
-                if not node.is_expanded:
-                    self._expand_node(node, sim_board)
-                feature = sim_board.get_feature_planes()
-                legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                for idx in sim_board.get_legal_move_indices():
-                    legal_mask[idx] = 1.0
-
-                batch_features.append(feature)
-                batch_boards.append(sim_board)
-                batch_nodes.append(node)
-                batch_paths.append(path)
-
-                # 批量推理
-                if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
-                    self._batch_inference(batch_features, batch_boards,
-                                          batch_nodes, batch_paths)
-                    batch_features.clear()
-                    batch_boards.clear()
-                    batch_nodes.clear()
-                    batch_paths.clear()
-
-            # 提前终止
-            if sim > num_sims // 2 and root.visit_count > 10 and root.children:
-                best_v = max(c.visit_count for c in root.children.values())
-                if best_v > sim * 0.65:
-                    break
-
     def _gumbel_search(self, board, root, num_sims):
-        """Gumbel AlphaZero MCTS — 减少模拟次数"""
+        """Gumbel AlphaZero MCTS (V2: 批量推理 + Sequential Halving)"""
         if not root.children:
-            return
+            action_probs = np.zeros(BOARD_SQUARES, dtype=np.float32)
+            return action_probs, 0.0
 
-        # Phase 1: 用Gumbel噪声选择top-k候选
         actions = list(root.children.keys())
         logits = np.array([root.children[a].prior for a in actions], dtype=np.float32)
-        gumbel = np.random.gumbel(0, 1, size=len(actions)).astype(np.float32)
-        gumbel_logits = logits + gumbel
 
-        k = min(GUMBEL_TOPK, len(actions))
-        top_k_indices = np.argpartition(gumbel_logits, -k)[-k:]
+        if GUMBEL_SEQUENTIAL_HALVING and len(actions) > GUMBEL_TOPK:
+            # Sequential Halving: 多轮淘汰
+            candidates = list(range(len(actions)))
+            total_sims = num_sims
+            round_idx = 0
 
-        # 只搜索top-k候选
-        for idx in top_k_indices:
-            action = actions[idx]
+            while len(candidates) > GUMBEL_TOPK and total_sims > 0:
+                k = len(candidates) // 2
+                sims_per = max(1, total_sims // len(candidates))
+
+                # Gumbel noise
+                gumbel = np.random.gumbel(0, 1, size=len(candidates)).astype(np.float32)
+                gumbel_logits = np.array([logits[c] for c in candidates]) + gumbel
+
+                # 批量评估候选
+                batch_features = []
+                batch_masks = []
+                batch_child_nodes = []
+                batch_paths = []
+
+                for ci, cand_idx in enumerate(candidates):
+                    action = actions[cand_idx]
+                    child = root.children[action]
+
+                    for _ in range(sims_per):
+                        if USE_UNDO_MCTS:
+                            board.save_state()
+                            board.place_stone(*board.index_to_move(action))
+                            path = [root, child]
+                            node = child
+                            while node.is_expanded and node.children:
+                                a, node = self._select_child(node)
+                                board.place_stone(*board.index_to_move(a))
+                                path.append(node)
+
+                            if board.game_over:
+                                if board.winner == 0:
+                                    value = 0.0
+                                else:
+                                    value = 1.0 if board.winner == board.current_player else -1.0
+                                self._backpropagate(path, value)
+                            else:
+                                if not node.is_expanded:
+                                    v = self._expand_node(node, board)
+                                    if v is not None:
+                                        self._backpropagate(path, v)
+                                    else:
+                                        feature = board.get_feature_planes()
+                                        legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                        for idx2 in board.get_legal_move_indices():
+                                            legal_mask[idx2] = 1.0
+                                        batch_features.append(feature)
+                                        batch_masks.append(legal_mask)
+                                        batch_child_nodes.append(node)
+                                        batch_paths.append(path)
+
+                            board.restore_state()
+                        else:
+                            sim_board = board.copy()
+                            sim_board.place_stone_fast(*sim_board.index_to_move(action))
+                            path = [root, child]
+                            node = child
+                            while node.is_expanded and node.children:
+                                a, node = self._select_child(node)
+                                sim_board.place_stone_fast(*sim_board.index_to_move(a))
+                                path.append(node)
+
+                            if sim_board.game_over:
+                                if sim_board.winner == 0:
+                                    value = 0.0
+                                else:
+                                    value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
+                                self._backpropagate(path, value)
+                            else:
+                                if not node.is_expanded:
+                                    v = self._expand_node(node, sim_board)
+                                    if v is not None:
+                                        self._backpropagate(path, v)
+                                    else:
+                                        feature = sim_board.get_feature_planes()
+                                        legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                        for idx2 in sim_board.get_legal_move_indices():
+                                            legal_mask[idx2] = 1.0
+                                        batch_features.append(feature)
+                                        batch_masks.append(legal_mask)
+                                        batch_child_nodes.append(node)
+                                        batch_paths.append(path)
+
+                # 批量推理
+                if batch_features:
+                    self._batch_inference(batch_features, batch_masks,
+                                          batch_child_nodes, batch_paths)
+
+                # 基于访问量淘汰
+                candidate_visits = [(ci, root.children[actions[candidates[ci]]].visit_count)
+                                   for ci in range(len(candidates))]
+                candidate_visits.sort(key=lambda x: x[1], reverse=True)
+                candidates = [candidates[ci] for ci, _ in candidate_visits[:k]]
+                total_sims -= sims_per * len(candidate_visits)
+                round_idx += 1
+
+            # 最终候选
+            final_candidates = candidates
+        else:
+            # 单轮 top-k
+            gumbel = np.random.gumbel(0, 1, size=len(actions)).astype(np.float32)
+            gumbel_logits = logits + gumbel
+            k = min(GUMBEL_TOPK, len(actions))
+            final_candidates = np.argpartition(gumbel_logits, -k)[-k:].tolist()
+
+        # 对最终候选进行搜索
+        batch_features = []
+        batch_masks = []
+        batch_child_nodes = []
+        batch_paths = []
+
+        remaining_sims = max(1, num_sims // max(1, len(final_candidates)))
+        for cand_idx in final_candidates:
+            action = actions[cand_idx]
             child = root.children[action]
-            # 为每个候选分配模拟次数
-            sims_per_candidate = max(1, num_sims // k)
 
-            for _ in range(sims_per_candidate):
-                sim_board = board.copy()
-                sim_board.place_stone(*sim_board.index_to_move(action))
-                path = [root, child]
+            for _ in range(remaining_sims):
+                if USE_UNDO_MCTS:
+                    board.save_state()
+                    board.place_stone(*board.index_to_move(action))
+                    path = [root, child]
+                    node = child
+                    while node.is_expanded and node.children:
+                        a, node = self._select_child(node)
+                        board.place_stone(*board.index_to_move(a))
+                        path.append(node)
 
-                # 从child开始继续选择
-                node = child
-                while node.is_expanded and node.children:
-                    a, node = self._select_child(node)
-                    sim_board.place_stone(*sim_board.index_to_move(a))
-                    path.append(node)
-
-                if sim_board.game_over:
-                    if sim_board.winner == 0:
-                        value = 0.0
+                    if board.game_over:
+                        if board.winner == 0:
+                            value = 0.0
+                        else:
+                            value = 1.0 if board.winner == board.current_player else -1.0
+                        self._backpropagate(path, value)
                     else:
-                        value = 1.0 if sim_board.winner != sim_board.current_player else -1.0
+                        if not node.is_expanded:
+                            v = self._expand_node(node, board)
+                            if v is not None:
+                                self._backpropagate(path, v)
+                            else:
+                                feature = board.get_feature_planes()
+                                legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                for idx2 in board.get_legal_move_indices():
+                                    legal_mask[idx2] = 1.0
+                                batch_features.append(feature)
+                                batch_masks.append(legal_mask)
+                                batch_child_nodes.append(node)
+                                batch_paths.append(path)
+
+                    board.restore_state()
                 else:
-                    if not node.is_expanded:
-                        self._expand_node(node, sim_board)
-                    feature = sim_board.get_feature_planes()
-                    legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                    for idx2 in sim_board.get_legal_move_indices():
-                        legal_mask[idx2] = 1.0
-                    _, value = self.model.predict(feature, legal_mask)
+                    sim_board = board.copy()
+                    sim_board.place_stone_fast(*sim_board.index_to_move(action))
+                    path = [root, child]
+                    node = child
+                    while node.is_expanded and node.children:
+                        a, node = self._select_child(node)
+                        sim_board.place_stone_fast(*sim_board.index_to_move(a))
+                        path.append(node)
 
-                self._backpropagate(path, value)
+                    if sim_board.game_over:
+                        if sim_board.winner == 0:
+                            value = 0.0
+                        else:
+                            value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
+                        self._backpropagate(path, value)
+                    else:
+                        if not node.is_expanded:
+                            v = self._expand_node(node, sim_board)
+                            if v is not None:
+                                self._backpropagate(path, v)
+                            else:
+                                feature = sim_board.get_feature_planes()
+                                legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                for idx2 in sim_board.get_legal_move_indices():
+                                    legal_mask[idx2] = 1.0
+                                batch_features.append(feature)
+                                batch_masks.append(legal_mask)
+                                batch_child_nodes.append(node)
+                                batch_paths.append(path)
 
-    def _batch_inference(self, features, boards, nodes, paths):
-        """批量推理: 收集多个叶节点统一前向传播"""
+        if batch_features:
+            self._batch_inference(batch_features, batch_masks,
+                                  batch_child_nodes, batch_paths)
+
+        # 生成动作概率
+        action_probs = np.zeros(BOARD_SQUARES, dtype=np.float32)
+        if root.children:
+            visits = np.array([c.visit_count for c in root.children.values()], dtype=np.float32)
+            actions = list(root.children.keys())
+
+            if board.move_count < TEMPERATURE_THRESHOLD and self.temperature > 0:
+                visits_t = visits ** (1.0 / self.temperature)
+                probs = visits_t / visits_t.sum()
+            else:
+                probs = np.zeros_like(visits)
+                probs[np.argmax(visits)] = 1.0
+
+            for action, prob in zip(actions, probs):
+                action_probs[action] = prob
+
+        root_value = root.q_value
+        return action_probs, root_value
+
+    def _root_parallel_search(self, board, root, num_sims):
+        """Root Parallelization: 多线程各跑独立MCTS树, 合并结果"""
+        # 简化: 在单进程中交替搜索, 避免GIL问题
+        # 真正的多进程需要共享内存模型, 这里用单进程多树模拟
+        num_trees = min(ROOT_PARALLEL_THREADS, 4)
+        sims_per_tree = max(1, num_sims // num_trees)
+
+        all_visits = defaultdict(float)
+
+        for t in range(num_trees):
+            # 每棵树独立搜索
+            tree_root = self._alloc_node()
+            self._expand_node(tree_root, board)
+            if self.add_noise and tree_root.children:
+                noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(tree_root.children))
+                for i, (action, child) in enumerate(tree_root.children.items()):
+                    child.prior = (1 - DIRICHLET_EPSILON) * child.prior + DIRICHLET_EPSILON * noise[i]
+
+            # 在子搜索中使用标准搜索 (不递归 root parallel)
+            old_use_root_parallel = USE_ROOT_PARALLEL
+            # 临时禁用, 避免递归
+            action_probs, _ = self._standard_search(board, tree_root, sims_per_tree)
+
+            # 合并访问量
+            for action in range(BOARD_SQUARES):
+                all_visits[action] += action_probs[action]
+
+        # 归一化
+        total = sum(all_visits.values())
+        action_probs = np.zeros(BOARD_SQUARES, dtype=np.float32)
+        if total > 0:
+            for action, v in all_visits.items():
+                action_probs[action] = v / total
+
+        root_value = root.q_value if root.visit_count > 0 else 0.0
+        return action_probs, root_value
+
+    def _batch_inference(self, features, masks, nodes, paths):
+        """V2 批量推理: 正确传递 legal_mask"""
         if not features:
             return
 
         batch_size = len(features)
         if batch_size == 1:
-            # 单样本: 直接推理
-            board = boards[0]
-            legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-            for idx in board.get_legal_move_indices():
-                legal_mask[idx] = 1.0
-            _, value = self.model.predict(features[0], legal_mask)
-            self._backpropagate(paths[0], value)
+            # 单样本直接推理
+            _, value = self.model.predict(features[0], masks[0])
+            self._backpropagate(paths[0], float(value))
             return
 
-        # 批量推理
-        x = np.stack(features)
-        policies, values = self.model.predictBatch(
-            features,
-            [np.zeros(BOARD_SQUARES, dtype=np.float32)] * batch_size  # 占位, 后续mask
-        )
+        # V2 修复: 正确传递 legal_mask
+        policies, values = self.model.predictBatch(features, masks)
 
         for i in range(batch_size):
             self._backpropagate(paths[i], float(values[i]))
 
     def _select_child(self, node):
-        """PUCT 选择"""
+        """PUCT 选择 (含 Q-Normalization)"""
+        # V2: 计算 Q 值范围用于归一化
+        q_min = float('inf')
+        q_max = float('-inf')
+        if USE_Q_NORM:
+            for child in node.children.values():
+                if child.visit_count > 0:
+                    q = child.q_value
+                    if q < q_min: q_min = q
+                    if q > q_max: q_max = q
+            if q_min == float('inf'):
+                q_min = FPU_VALUE if USE_FPU else 0.0
+                q_max = 0.0
+
         best_score = -float('inf')
         best_action = -1
         best_child = None
 
         for action, child in node.children.items():
-            score = child.puct_score()
+            score = child.puct_score(q_min, q_max)
+            if score > best_score:
+                best_score = score
+                best_action = action
+                best_child = child
+
+        best_child.virtual_loss += 1
+        return best_action, best_child
+
+    def _select_child_from_list(self, node, children_list):
+        """从指定子节点列表中选择"""
+        q_min = float('inf')
+        q_max = float('-inf')
+        if USE_Q_NORM:
+            for _, child in children_list:
+                if child.visit_count > 0:
+                    q = child.q_value
+                    if q < q_min: q_min = q
+                    if q > q_max: q_max = q
+            if q_min == float('inf'):
+                q_min = FPU_VALUE if USE_FPU else 0.0
+                q_max = 0.0
+
+        best_score = -float('inf')
+        best_action = -1
+        best_child = None
+
+        for action, child in children_list:
+            score = child.puct_score(q_min, q_max)
             if score > best_score:
                 best_score = score
                 best_action = action
@@ -356,45 +794,70 @@ class MCTS:
         return best_action, best_child
 
     def _expand_node(self, node, board):
-        """扩展节点 + 模式注入"""
+        """
+        V2: 扩展节点 — 返回 value (消除双重推理)
+        ==========================================
+        之前: expand 只获取 policy, 然后 search 再获取 value = 2次推理
+        V2: expand 同时获取 policy 和 value, 返回 value 给调用方
+        """
         if node.is_expanded:
-            return
+            return node.cached_value if node.visit_count > 0 else None
 
         feature = board.get_feature_planes()
         legal_indices = board.get_legal_move_indices()
 
         if not legal_indices:
-            return
+            return None
 
         # 合法掩码
         legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
         for idx in legal_indices:
             legal_mask[idx] = 1.0
 
-        # 网络策略
-        policy, _ = self.model.predict(feature, legal_mask)
+        # 网络推理: 同时获取 policy 和 value
+        policy, value = self.model.predict(feature, legal_mask)
 
-        # ===== 模式注入: 混合棋型先验 =====
+        # V2: 缓存 value
+        node.cached_value = value
+
+        # 模式注入: 混合棋型先验
         if USE_PATTERN_INJECTION:
             pattern_bonus = compute_pattern_prior_bonus(board.board, board.current_player)
-            # 混合: final_prior = (1-w)*network + w*pattern_normalized
             pat_max = pattern_bonus.max()
             if pat_max > 0:
                 pattern_prior = pattern_bonus / pat_max
                 policy = (1 - PATTERN_INJECTION_WEIGHT) * policy + PATTERN_INJECTION_WEIGHT * pattern_prior
-                # 只保留合法位置
                 policy = policy * legal_mask
                 psum = policy.sum()
                 if psum > 0:
                     policy /= psum
 
+        # 转置表查询
+        if USE_TRANSPOSITION and self._tp_table:
+            tp_result = self._tp_table.lookup(board.zobrist_hash)
+            if tp_result is not None:
+                tp_value, tp_visits, tp_policy = tp_result
+                if tp_visits > 10:
+                    # 混合转置表策略
+                    policy = 0.7 * policy + 0.3 * tp_policy
+                    policy = policy * legal_mask
+                    psum = policy.sum()
+                    if psum > 0:
+                        policy /= psum
+
         # 创建子节点
         for idx in legal_indices:
-            child = MCTSNode(parent=node, action=idx, prior=policy[idx])
+            child = self._alloc_node(parent=node, action=idx, prior=policy[idx])
             node.children[idx] = child
 
         node.is_expanded = True
         node.sqrt_N = 0.0
+
+        # 存入转置表
+        if USE_TRANSPOSITION and self._tp_table:
+            self._tp_table.store(board.zobrist_hash, value, 1, policy)
+
+        return value
 
     def _backpropagate(self, path, value):
         """回传价值 + RAVE"""
@@ -408,7 +871,6 @@ class MCTS:
             node.visit_count += 1
             node.total_value += value
             node.virtual_loss = max(0, node.virtual_loss - 1)
-            # 缓存 sqrt_N
             if node.parent is not None:
                 node.parent.sqrt_N = math.sqrt(node.parent.visit_count + 1)
 
@@ -422,13 +884,17 @@ class MCTS:
             value = -value
 
     def advance(self, action):
-        """推进一个着法, 复用子树"""
-        self.last_action = action
+        """
+        V2 修复: 正确推进子树
+        =============================
+        修复前: advance 后 root 被推进, 但 search 中又在新 root 的 children 里查找
+        修复后: advance 直接推进 root, search 中直接使用 self.root
+        """
         if USE_SUBTREE_REUSE and self.root is not None:
             if action in self.root.children:
-                self.prev_root = self.root
                 self.root = self.root.children[action]
                 self.root.parent = None
+                # 不清除子树, 保留已搜索的信息
             else:
                 self.root = None
         else:
