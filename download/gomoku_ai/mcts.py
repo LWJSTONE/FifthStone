@@ -117,7 +117,8 @@ class MCTSNode:
         'parent', 'action', 'prior', 'visit_count', 'total_value',
         'virtual_loss', 'children', 'is_expanded',
         'rave_count', 'rave_value', 'board_hash', 'sqrt_N',
-        'cached_value'  # V2: 缓存扩展时的value, 消除双重推理
+        'cached_value',  # V2: 缓存扩展时的value, 消除双重推理
+        'original_prior'  # V3: 保存网络原始prior, 防止Dirichlet噪声累积
     ]
 
     def __init__(self, parent=None, action=None, prior=0.0):
@@ -134,6 +135,7 @@ class MCTSNode:
         self.board_hash = 0
         self.sqrt_N = 0.0
         self.cached_value = 0.0  # V2: 扩展时缓存
+        self.original_prior = 0.0  # V3: 网络原始prior
 
     def _reset(self, parent=None, action=None, prior=0.0):
         """重置节点 (用于 Node Pool 复用)"""
@@ -150,6 +152,7 @@ class MCTSNode:
         self.board_hash = 0
         self.sqrt_N = 0.0
         self.cached_value = 0.0
+        self.original_prior = 0.0
 
     @property
     def q_value(self):
@@ -262,11 +265,12 @@ class MCTS:
             # 直接使用当前的 self.root 作为新搜索的根
             if self.root.is_expanded and self.root.children:
                 root = self.root
-                # 重置 Dirichlet 噪声
+                # V3 修复: 基于 original_prior 施加 Dirichlet 噪声, 防止累积
                 if self.add_noise and root.children:
                     noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(root.children))
                     for i, (action, child) in enumerate(root.children.items()):
-                        child.prior = (1 - DIRICHLET_EPSILON) * child.prior + DIRICHLET_EPSILON * noise[i]
+                        base_prior = child.original_prior if child.original_prior > 0 else child.prior
+                        child.prior = (1 - DIRICHLET_EPSILON) * base_prior + DIRICHLET_EPSILON * noise[i]
 
         if root is None:
             # V2 修复: 先 reset pool, 再创建 root 及其子节点
@@ -274,10 +278,12 @@ class MCTS:
                 self._node_pool.reset()
             root = self._alloc_node()
             self._expand_node(root, board)
+            # V3: 新root的噪声也基于original_prior
             if self.add_noise and root.children:
                 noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(root.children))
                 for i, (action, child) in enumerate(root.children.items()):
-                    child.prior = (1 - DIRICHLET_EPSILON) * child.prior + DIRICHLET_EPSILON * noise[i]
+                    base_prior = child.original_prior if child.original_prior > 0 else child.prior
+                    child.prior = (1 - DIRICHLET_EPSILON) * base_prior + DIRICHLET_EPSILON * noise[i]
 
         self.root = root
 
@@ -335,7 +341,8 @@ class MCTS:
                             action, node = self._select_child(node)
                     else:
                         action, node = self._select_child(node)
-                    board.place_stone(*board.index_to_move(action))
+                    # V3: 用place_stone_fast替代place_stone, 省去无用的棋型计算
+                    board.place_stone_fast(*board.index_to_move(action))
                     path.append(node)
 
                 # 评估
@@ -367,16 +374,10 @@ class MCTS:
                             batch_paths.append(path)
                             batch_boards.append((board.board.copy(), board.current_player))
                     else:
-                        # 已扩展但需要重新评估
-                        feature = board.get_feature_planes()
-                        legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                        for idx in board.get_legal_move_indices():
-                            legal_mask[idx] = 1.0
-                        batch_features.append(feature)
-                        batch_masks.append(legal_mask)
-                        batch_nodes.append(node)
-                        batch_paths.append(path)
-                        batch_boards.append(None)  # 已扩展, 不需要board
+                        # V3 修复: 已扩展节点直接使用cached_value, 不做冗余推理
+                        # (网络在搜索过程中不变, 重复推理结果相同)
+                        value = node.cached_value if node.visit_count == 0 else node.q_value
+                        self._backpropagate(path, value)
 
                     # 批量推理
                     if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
@@ -426,15 +427,9 @@ class MCTS:
                             batch_paths.append(path)
                             batch_boards.append((sim_board.board.copy(), sim_board.current_player))
                     else:
-                        feature = sim_board.get_feature_planes()
-                        legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                        for idx in sim_board.get_legal_move_indices():
-                            legal_mask[idx] = 1.0
-                        batch_features.append(feature)
-                        batch_masks.append(legal_mask)
-                        batch_nodes.append(node)
-                        batch_paths.append(path)
-                        batch_boards.append(None)  # 已扩展
+                        # V3 修复: 已扩展节点直接使用cached_value, 不做冗余推理
+                        value = node.cached_value if node.visit_count == 0 else node.q_value
+                        self._backpropagate(path, value)
 
                     if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
                         if batch_features:
@@ -792,9 +787,10 @@ class MCTS:
                 if psum > 0:
                     policy /= psum
 
-        # 创建子节点
+        # 创建子节点 — V3: 保存网络原始prior
         for idx in legal_indices:
             child = self._alloc_node(parent=node, action=int(idx), prior=policy[idx])
+            child.original_prior = policy[idx]  # V3: 保存原始prior
             node.children[int(idx)] = child
 
         node.is_expanded = True
@@ -909,9 +905,10 @@ class MCTS:
                     if psum > 0:
                         policy /= psum
 
-        # 创建子节点
+        # 创建子节点 — V3: 保存网络原始prior
         for idx in legal_indices:
             child = self._alloc_node(parent=node, action=idx, prior=policy[idx])
+            child.original_prior = policy[idx]  # V3: 保存原始prior
             node.children[idx] = child
 
         node.is_expanded = True
@@ -956,8 +953,15 @@ class MCTS:
         """
         if USE_SUBTREE_REUSE and self.root is not None:
             if action in self.root.children:
-                self.root = self.root.children[action]
-                self.root.parent = None
+                new_root = self.root.children[action]
+                new_root.parent = None
+                # V3 修复: 清理旧root未选中子节点的引用, 帮助GC回收
+                old_root = self.root
+                for act, child in old_root.children.items():
+                    if act != action:
+                        child.parent = None  # 断开引用, 允许GC回收
+                old_root.children.clear()
+                self.root = new_root
                 # 不清除子树, 保留已搜索的信息
             else:
                 self.root = None

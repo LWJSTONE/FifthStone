@@ -1,6 +1,15 @@
 """
-VCT/VCF 威胁空间搜索 + 必走着法快速检测 (V2 — 全面修复版)
+VCT/VCF 威胁空间搜索 + 必走着法快速检测 (V3 — gap模式修复版)
 =========================================================
+V3 修复:
+  1. 新增 _analyze_line_pattern_with_gap: 检测断四/断三等gap模式
+  2. _find_four_blocking_moves: 同时返回断四的gap堵点
+  3. _get_threat_type_at / _count_threats_at: 综合连续+gap分析
+  4. find_must_move: 双威胁检测包含gap模式
+  5. VCT深度修正: depth_limit - 1 (而非 - 2)
+  6. VCF/VCT攻防: 均检测gap模式
+  7. 棋型常量重排序: 数值越大=威胁越强, 修正比较逻辑
+
 V2 修复:
   1. VCF: 只搜索堵四着法 + 全称逻辑(所有堵法后都能VCF才算赢)
   2. VCT: 试所有强制防御着法 + 全称逻辑
@@ -27,15 +36,15 @@ WHITE = 2
 DIRECTIONS = np.array([[0, 1], [1, 0], [1, 1], [1, -1]], dtype=np.int32)
 NUM_DIRS = 4
 
-# 棋型编码
+# 棋型编码 (V3修复: 数值越大=威胁越强, 使 >/>=/< 比较正确)
 PATTERN_NONE = 0
-PATTERN_FIVE = 1
-PATTERN_OPEN_FOUR = 2       # 活四
-PATTERN_HALF_FOUR = 3       # 冲四/嵌五
+PATTERN_HALF_TWO = 1        # 眠二
+PATTERN_OPEN_TWO = 2        # 活二
+PATTERN_HALF_THREE = 3      # 眠三
 PATTERN_OPEN_THREE = 4      # 活三
-PATTERN_HALF_THREE = 5      # 眠三
-PATTERN_OPEN_TWO = 6        # 活二
-PATTERN_HALF_TWO = 7        # 眠二
+PATTERN_HALF_FOUR = 5       # 冲四/嵌五
+PATTERN_OPEN_FOUR = 6       # 活四
+PATTERN_FIVE = 7            # 五连
 
 
 # ======================== Numba JIT 核心函数 ========================
@@ -74,8 +83,139 @@ def _analyze_line_pattern(board, r, c, dr, dc, color):
 
 
 @njit(cache=NUMBA_CACHE)
+def _analyze_line_pattern_with_gap(board, r, c, dr, dc, color):
+    """
+    Gap-aware line pattern analysis (断四/断三检测)
+    ===============================================
+    扫描所有包含(r,c)的5格窗口, 检测含1个gap的模式:
+      - 断四: 4子+1空在5格窗口 → 等价于冲四(堵gap即防五)
+        例: O_OOO, OO_OO, OOO_O
+      - 断三: 3子+1内部gap在5格窗口 → 等价于活三/眠三
+        例: _O_OO_, _OO_O_
+
+    返回: (effective_length, open_ends, gap_pos)
+      effective_length: 4=断四, 3=断三, 0=无gap模式
+      open_ends: 开放端数(用于棋型分类)
+      gap_pos: gap位置的flat index, -1=无
+    """
+    best_length = 0
+    best_open_ends = 0
+    best_gap_pos = -1
+
+    # 尝试所有包含(r,c)的5格窗口
+    for start_offset in range(-4, 1):
+        stone_count = 0
+        empty_count = 0
+        opponent_count = 0
+        gap_flat = -1
+
+        cell_vals = np.zeros(5, dtype=np.int32)   # 0=empty, 1=stone, 2=opponent
+        cell_flats = np.zeros(5, dtype=np.int32)
+
+        valid = True
+        for i in range(5):
+            cr = r + (start_offset + i) * dr
+            cc = c + (start_offset + i) * dc
+            if cr < 0 or cr >= BOARD_SIZE or cc < 0 or cc >= BOARD_SIZE:
+                valid = False
+                break
+            flat = cr * BOARD_SIZE + cc
+            cell_flats[i] = flat
+            cell = board[cr, cc]
+            if cr == r and cc == c:
+                # 正在评估的位置, 视为己方棋子
+                cell_vals[i] = 1
+                stone_count += 1
+            elif cell == color:
+                cell_vals[i] = 1
+                stone_count += 1
+            elif cell == EMPTY:
+                cell_vals[i] = 0
+                empty_count += 1
+            else:
+                cell_vals[i] = 2
+                opponent_count += 1
+
+        if not valid or opponent_count > 0:
+            continue
+
+        # ---- 断四: 4子 + 1空 ----
+        if empty_count == 1 and stone_count == 4:
+            for i in range(5):
+                if cell_vals[i] == 0:
+                    gap_flat = cell_flats[i]
+                    break
+
+            # 断四等价于冲四: 只有一个必堵点(gap)
+            if best_length < 4:
+                best_length = 4
+                best_open_ends = 1
+                best_gap_pos = gap_flat
+
+        # ---- 断三: 3子 + 2空, 其中1空为"内部gap" ----
+        elif empty_count == 2 and stone_count == 3:
+            # 检查是否存在"内部gap": 填入后形成4连
+            for g in range(5):
+                if cell_vals[g] != 0:
+                    continue
+                # 从gap位置向两侧数连续己方棋子数(含gap本身)
+                consec = 1
+                for k in range(g - 1, -1, -1):
+                    if cell_vals[k] == 1:
+                        consec += 1
+                    else:
+                        break
+                for k in range(g + 1, 5):
+                    if cell_vals[k] == 1:
+                        consec += 1
+                    else:
+                        break
+
+                if consec >= 4:
+                    # 内部gap: 填入后形成4连
+                    # 计算4连的范围
+                    four_start = g
+                    for k in range(g - 1, -1, -1):
+                        if cell_vals[k] == 1:
+                            four_start = k
+                        else:
+                            break
+                    four_end = g
+                    for k in range(g + 1, 5):
+                        if cell_vals[k] == 1:
+                            four_end = k
+                        else:
+                            break
+
+                    # 计算开放端
+                    open_ends = 0
+                    if four_start > 0 and cell_vals[four_start - 1] == 0:
+                        open_ends += 1
+                    elif four_start == 0:
+                        br2 = r + (start_offset - 1) * dr
+                        bc2 = c + (start_offset - 1) * dc
+                        if 0 <= br2 < BOARD_SIZE and 0 <= bc2 < BOARD_SIZE and board[br2, bc2] == EMPTY:
+                            open_ends += 1
+                    if four_end < 4 and cell_vals[four_end + 1] == 0:
+                        open_ends += 1
+                    elif four_end == 4:
+                        ar2 = r + (start_offset + 5) * dr
+                        ac2 = c + (start_offset + 5) * dc
+                        if 0 <= ar2 < BOARD_SIZE and 0 <= ac2 < BOARD_SIZE and board[ar2, ac2] == EMPTY:
+                            open_ends += 1
+
+                    if 3 > best_length or (3 == best_length and open_ends > best_open_ends):
+                        best_length = 3
+                        best_open_ends = open_ends
+                        best_gap_pos = cell_flats[g]
+                    break  # 找到内部gap, 不再检查其他空位
+
+    return (best_length, best_open_ends, best_gap_pos)
+
+
+@njit(cache=NUMBA_CACHE)
 def _get_pattern_type(length, open_ends):
-    """将(连子数, 开放端)映射为棋型编码"""
+    """将(连子数, 开放端)映射为棋型编码 (V3: 数值越大=威胁越强)"""
     if length >= 5:
         return PATTERN_FIVE
     if length == 4:
@@ -118,20 +258,21 @@ def _check_five(board, r, c, color):
     return False
 
 
-# ======================== VCF 搜索 (V2 修复版) ========================
+# ======================== VCF 搜索 (V3 gap修复版) ========================
 
 @njit(cache=NUMBA_CACHE)
 def _find_four_blocking_moves(board, four_r, four_c, attacker):
     """
-    找到堵住冲四的着法位置
-    ============================
-    当(four_r, four_c)形成冲四(4连+1开放端)时,
-    返回堵住这个四的唯一/两个位置
+    找到堵住冲四的着法位置 (V3: 包含断四gap检测)
+    ================================================
+    当(four_r, four_c)形成冲四(4连+1开放端)或断四(4子1空)时,
+    返回堵住这个四的位置
 
-    返回: (positions, count) — 堵四位置, 最多2个
+    返回: (positions, count) — 堵四位置, 最多4个
     """
-    positions = np.empty(2, dtype=np.int32)
+    positions = np.empty(4, dtype=np.int32)
     count = 0
+    seen = np.zeros(BOARD_SQUARES, dtype=np.int32)
 
     for d in range(NUM_DIRS):
         dr = DIRECTIONS[d, 0]
@@ -141,18 +282,58 @@ def _find_four_blocking_moves(board, four_r, four_c, attacker):
         total = pos_count + neg_count + 1
 
         if total == 4:
-            # 找到了四连的方向
+            # 找到了连续四连的方向
             # 正方向端点
             er, ec = four_r + dr * (pos_count + 1), four_c + dc * (pos_count + 1)
             if 0 <= er < BOARD_SIZE and 0 <= ec < BOARD_SIZE and board[er, ec] == EMPTY:
-                if count < 2:
-                    positions[count] = er * BOARD_SIZE + ec
+                flat = er * BOARD_SIZE + ec
+                if seen[flat] == 0 and count < 4:
+                    seen[flat] = 1
+                    positions[count] = flat
                     count += 1
             # 反方向端点
             br, bc = four_r - dr * (neg_count + 1), four_c - dc * (neg_count + 1)
             if 0 <= br < BOARD_SIZE and 0 <= bc < BOARD_SIZE and board[br, bc] == EMPTY:
-                if count < 2:
-                    positions[count] = br * BOARD_SIZE + bc
+                flat = br * BOARD_SIZE + bc
+                if seen[flat] == 0 and count < 4:
+                    seen[flat] = 1
+                    positions[count] = flat
+                    count += 1
+
+        # 检查断四(gap four): 4子+1空在5格窗口内
+        for start_offset in range(-4, 1):
+            stone_count = 0
+            empty_count = 0
+            opponent_count = 0
+            gap_flat = -1
+
+            valid = True
+            for i in range(5):
+                cr = four_r + (start_offset + i) * dr
+                cc = four_c + (start_offset + i) * dc
+                if cr < 0 or cr >= BOARD_SIZE or cc < 0 or cc >= BOARD_SIZE:
+                    valid = False
+                    break
+                flat = cr * BOARD_SIZE + cc
+                cell = board[cr, cc]
+                if cr == four_r and cc == four_c:
+                    stone_count += 1
+                elif cell == attacker:
+                    stone_count += 1
+                elif cell == EMPTY:
+                    empty_count += 1
+                    gap_flat = flat
+                else:
+                    opponent_count += 1
+
+            if not valid or opponent_count > 0:
+                continue
+
+            if empty_count == 1 and stone_count == 4:
+                # 断四: 空位是必须堵的位置
+                if gap_flat >= 0 and seen[gap_flat] == 0 and count < 4:
+                    seen[gap_flat] = 1
+                    positions[count] = gap_flat
                     count += 1
 
     return positions, count
@@ -161,11 +342,11 @@ def _find_four_blocking_moves(board, four_r, four_c, attacker):
 @njit(cache=NUMBA_CACHE)
 def _find_forced_defense_moves(board, attacker, defender, buf):
     """
-    找到对手的强制防御着法
-    ==========================
+    找到对手的强制防御着法 (V3: 包含断四检测)
+    ==========================================
     对手必须防守的着法包括:
       1. 对手能直接五连的位置
-      2. 堵攻击方冲四的位置
+      2. 堵攻击方冲四/断四的位置
 
     返回: (positions, count)
     """
@@ -183,14 +364,15 @@ def _find_forced_defense_moves(board, attacker, defender, buf):
                 # 对手有五连, 这是必须防守的
                 return buf, count
 
-    # 2. 堵攻击方的冲四
-    # 先找到攻击方的所有冲四位置
+    # 2. 堵攻击方的冲四/断四
+    # 先找到攻击方的所有冲四/断四位置
     four_positions = np.empty(BOARD_SQUARES, dtype=np.int32)
     four_count = 0
     for r in range(BOARD_SIZE):
         for c in range(BOARD_SIZE):
             if board[r, c] != EMPTY:
                 continue
+            is_four = False
             for d in range(NUM_DIRS):
                 dr = DIRECTIONS[d, 0]
                 dc = DIRECTIONS[d, 1]
@@ -199,15 +381,25 @@ def _find_forced_defense_moves(board, attacker, defender, buf):
                     # 攻击方直接五连, 不需要防守
                     return buf, 0
                 if length == 4 and open_ends >= 1:
-                    four_positions[four_count] = r * BOARD_SIZE + c
-                    four_count += 1
-                    break  # 这个位置已经是一个四, 不需要重复
+                    is_four = True
+                    break
+                # 检查断四
+                gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+                    board, r, c, dr, dc, attacker
+                )
+                if gap_length == 4:
+                    is_four = True
+                    break
 
-    # 对于每个冲四位置, 找到堵住它的位置
+            if is_four:
+                four_positions[four_count] = r * BOARD_SIZE + c
+                four_count += 1
+
+    # 对于每个冲四/断四位置, 找到堵住它的位置
     seen = np.zeros(BOARD_SQUARES, dtype=np.int32)
     for i in range(four_count):
         fr, fc = four_positions[i] // BOARD_SIZE, four_positions[i] % BOARD_SIZE
-        # 在这个位置落子形成冲四
+        # 在这个位置落子形成冲四/断四
         board[fr, fc] = attacker
         blocking_positions, blocking_count = _find_four_blocking_moves(
             board, fr, fc, attacker
@@ -227,11 +419,11 @@ def _find_forced_defense_moves(board, attacker, defender, buf):
 @njit(cache=NUMBA_CACHE)
 def vcf_search(board, attacker, depth_limit=20):
     """
-    VCF搜索 V2: 正确的连续冲四取胜搜索
-    ==================================
+    VCF搜索 V3: 正确的连续冲四取胜搜索 (含断四检测)
+    ================================================
     修复:
-      - 只搜索冲四着法
-      - 对手只搜堵四位置(而非全部空位)
+      - 搜索冲四+断四着法
+      - 对手只搜堵四位置(含断四gap堵点)
       - 使用全称逻辑: 攻击方赢 = 对手所有堵法后攻击方都能VCF
 
     返回: winning_move 位置(0-224), -1 表示未找到
@@ -241,13 +433,13 @@ def vcf_search(board, attacker, depth_limit=20):
 
     defender = 3 - attacker
 
-    # 找攻击方的冲四着法
+    # 找攻击方的冲四/断四着法
     for r in range(BOARD_SIZE):
         for c in range(BOARD_SIZE):
             if board[r, c] != EMPTY:
                 continue
 
-            # 检查这步能否形成冲四或五连
+            # 检查这步能否形成冲四/断四或五连
             is_four = False
             is_five = False
             for d in range(NUM_DIRS):
@@ -259,6 +451,12 @@ def vcf_search(board, attacker, depth_limit=20):
                     break
                 if length == 4 and open_ends >= 1:
                     is_four = True
+                # 检查断四
+                gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+                    board, r, c, dr, dc, attacker
+                )
+                if gap_length == 4:
+                    is_four = True
 
             if is_five:
                 # 直接五连, 找到了
@@ -267,7 +465,7 @@ def vcf_search(board, attacker, depth_limit=20):
             if not is_four:
                 continue
 
-            # 落子(冲四)
+            # 落子(冲四/断四)
             board[r, c] = attacker
 
             # 检查对手是否有直接五连(对手可能选择不堵而自己五连)
@@ -286,7 +484,7 @@ def vcf_search(board, attacker, depth_limit=20):
                 board[r, c] = EMPTY
                 continue
 
-            # 找堵四的位置
+            # 找堵四的位置(含断四gap堵点)
             blocking_positions, blocking_count = _find_four_blocking_moves(
                 board, r, c, attacker
             )
@@ -322,31 +520,49 @@ def vcf_search(board, attacker, depth_limit=20):
     return -1
 
 
-# ======================== VCT 搜索 (V2 修复版) ========================
+# ======================== VCT 搜索 (V3 gap修复版) ========================
 
 @njit(cache=NUMBA_CACHE)
 def _get_threat_type_at(board, r, c, color):
-    """获取(r,c)落子后能形成的最强棋型"""
+    """获取(r,c)落子后能形成的最强棋型 (包含gap/断四模式)"""
     best = PATTERN_NONE
     for d in range(NUM_DIRS):
         dr = DIRECTIONS[d, 0]
         dc = DIRECTIONS[d, 1]
+        # 连续模式
         length, open_ends = _analyze_line_pattern(board, r, c, dr, dc, color)
         ptype = _get_pattern_type(length, open_ends)
         if ptype > best:
             best = ptype
+        # gap模式
+        gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+            board, r, c, dr, dc, color
+        )
+        if gap_length > 0:
+            gap_ptype = _get_pattern_type(gap_length, gap_open_ends)
+            if gap_ptype > best:
+                best = gap_ptype
     return best
 
 
 @njit(cache=NUMBA_CACHE)
 def _count_threats_at(board, r, c, color, min_threat):
-    """统计(r,c)落子后形成的威胁数量(≥min_threat的棋型数)"""
+    """统计(r,c)落子后形成的威胁数量(≥min_threat的棋型数, 包含gap模式)"""
     count = 0
     for d in range(NUM_DIRS):
         dr = DIRECTIONS[d, 0]
         dc = DIRECTIONS[d, 1]
+        # 连续模式
         length, open_ends = _analyze_line_pattern(board, r, c, dr, dc, color)
         ptype = _get_pattern_type(length, open_ends)
+        # gap模式 — 取两者中更强的
+        gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+            board, r, c, dr, dc, color
+        )
+        if gap_length > 0:
+            gap_ptype = _get_pattern_type(gap_length, gap_open_ends)
+            if gap_ptype > ptype:
+                ptype = gap_ptype
         if ptype >= min_threat:
             count += 1
     return count
@@ -355,12 +571,13 @@ def _count_threats_at(board, r, c, color, min_threat):
 @njit(cache=NUMBA_CACHE)
 def _find_vct_defense_moves(board, attacker, defender, buf):
     """
-    找到VCT中对手的强制防御着法
-    =============================
+    找到VCT中对手的强制防御着法 (V3: 包含断三gap堵点)
+    =================================================
     对手必须防守:
       1. 对手直接五连
-      2. 堵攻击方的冲四(必须堵)
+      2. 堵攻击方的冲四/断四(必须堵)
       3. 堵攻击方的活四(必须堵)
+      4. 堵攻击方的活三/断三(通常必须堵)
 
     返回: (positions, count)
     """
@@ -377,7 +594,7 @@ def _find_vct_defense_moves(board, attacker, defender, buf):
                     count += 1
                 return buf, count
 
-    # 2. 堵攻击方的冲四/活四
+    # 2. 堵攻击方的冲四/活四/断四
     seen = np.zeros(BOARD_SQUARES, dtype=np.int32)
 
     for r in range(BOARD_SIZE):
@@ -388,7 +605,7 @@ def _find_vct_defense_moves(board, attacker, defender, buf):
             threat_type = _get_threat_type_at(board, r, c, attacker)
 
             if threat_type >= PATTERN_HALF_FOUR:
-                # 冲四或更强: 对手必须堵
+                # 冲四/断四或更强: 对手必须堵
                 board[r, c] = attacker
                 blocking_positions, blocking_count = _find_four_blocking_moves(
                     board, r, c, attacker
@@ -407,16 +624,17 @@ def _find_vct_defense_moves(board, attacker, defender, buf):
                 # 堵活四的位置已经在上面处理了
                 pass
 
-    # 3. 堵攻击方的活三 (可选防御, 但通常必须堵)
+    # 3. 堵攻击方的活三/断三 (可选防御, 但通常必须堵)
     for r in range(BOARD_SIZE):
         for c in range(BOARD_SIZE):
             if board[r, c] != EMPTY:
                 continue
             threat_type = _get_threat_type_at(board, r, c, attacker)
             if threat_type == PATTERN_OPEN_THREE:
-                # 活三: 找堵它的位置
+                # 活三/断三: 找堵它的位置
                 board[r, c] = attacker
-                # 活三形成后, 对手应堵在活三的两个延伸端
+
+                # 3a. 连续活三的堵点
                 for d in range(NUM_DIRS):
                     dr = DIRECTIONS[d, 0]
                     dc = DIRECTIONS[d, 1]
@@ -440,6 +658,21 @@ def _find_vct_defense_moves(board, attacker, defender, buf):
                                 seen[bpos2] = 1
                                 buf[count] = bpos2
                                 count += 1
+
+                # 3b. 断三的gap堵点
+                for d in range(NUM_DIRS):
+                    dr = DIRECTIONS[d, 0]
+                    dc = DIRECTIONS[d, 1]
+                    gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+                        board, r, c, dr, dc, attacker
+                    )
+                    if gap_length == 3 and gap_open_ends >= 2 and gap_pos >= 0:
+                        # 断活三: gap位置是关键堵点
+                        if seen[gap_pos] == 0 and count < 30:
+                            seen[gap_pos] = 1
+                            buf[count] = gap_pos
+                            count += 1
+
                 board[r, c] = EMPTY
 
     # 4. 对手自己的高价值着法(可以不堵而进攻)
@@ -451,13 +684,14 @@ def _find_vct_defense_moves(board, attacker, defender, buf):
 @njit(cache=NUMBA_CACHE)
 def vct_search(board, attacker, depth_limit=12):
     """
-    VCT搜索 V2: 正确的连续威胁取胜搜索
-    ==================================
+    VCT搜索 V3: 正确的连续威胁取胜搜索 (含gap模式)
+    ==============================================
     修复:
       - 先试VCF
-      - 只搜活三及以上威胁着法
-      - 对手搜所有强制防御着法
+      - 只搜活三/断三及以上威胁着法
+      - 对手搜所有强制防御着法(含gap堵点)
       - 全称逻辑: 对手所有强制防御后攻击方都能VCT才算赢
+      - V3: depth递减修正为-1 (而非-2)
 
     返回: winning_move 位置, -1 表示未找到
     """
@@ -471,16 +705,16 @@ def vct_search(board, attacker, depth_limit=12):
     if vcf_result >= 0:
         return vcf_result
 
-    # 2. 找活三/冲四着法
+    # 2. 找活三/断三/冲四着法
     for r in range(BOARD_SIZE):
         for c in range(BOARD_SIZE):
             if board[r, c] != EMPTY:
                 continue
 
-            # 检查这步能形成什么棋型
+            # 检查这步能形成什么棋型 (包含gap模式)
             best_threat = _get_threat_type_at(board, r, c, attacker)
 
-            # 只搜活三及以上的威胁着法
+            # 只搜活三及以上的威胁着法 (V3: 数值越大=越强, >=PATTERN_OPEN_THREE)
             if best_threat < PATTERN_OPEN_THREE:
                 continue
 
@@ -512,7 +746,10 @@ def vct_search(board, attacker, depth_limit=12):
                 board[dr2, dc2] = defender
 
                 # 递归: 攻击方是否还能VCT
-                result = vct_search(board, attacker, depth_limit - 2)
+                # V3修复: depth_limit - 1 (而非 - 2)
+                # 理由: depth_limit表示攻击方还能走多少步,
+                #        每次VCT步骤(攻击+防御)应只消耗1层深度
+                result = vct_search(board, attacker, depth_limit - 1)
 
                 board[dr2, dc2] = EMPTY
 
@@ -528,13 +765,13 @@ def vct_search(board, attacker, depth_limit=12):
     return -1
 
 
-# ======================== 必走着法检测 (V2 增强版) ========================
+# ======================== 必走着法检测 (V3 gap增强版) ========================
 
 @njit(cache=NUMBA_CACHE)
 def find_must_move(board, current_player):
     """
-    必走着法检测 V2 — 包含双威胁检测
-    =================================
+    必走着法检测 V3 — 包含双威胁+gap模式检测
+    ========================================
     返回: (must_move_idx, move_type)
       must_move_idx: 0-224, -1=无必走
       move_type:
@@ -600,22 +837,31 @@ def find_must_move(board, current_player):
             # 简化: 返回对手活四位置(让MCTS决定怎么堵)
             return (opp_open_four_pos, 4)
 
-    # 5. 双威胁检测 — 五子棋最重要的战术模式!
+    # 5. 双威胁检测 — 五子棋最重要的战术模式! (V3: 包含gap模式)
     # 己方双威胁
     for r in range(BOARD_SIZE):
         for c in range(BOARD_SIZE):
             if board[r, c] != EMPTY:
                 continue
 
-            # 统计己方在各方向形成的威胁
-            half_four_count = 0  # 冲四数
-            open_three_count = 0  # 活三数
+            # 统计己方在各方向形成的威胁 (连续+gap取最强)
+            half_four_count = 0  # 冲四数(含断四)
+            open_three_count = 0  # 活三数(含断三)
 
             for d in range(NUM_DIRS):
                 dr = DIRECTIONS[d, 0]
                 dc = DIRECTIONS[d, 1]
+                # 连续模式
                 length, open_ends = _analyze_line_pattern(board, r, c, dr, dc, current_player)
                 ptype = _get_pattern_type(length, open_ends)
+                # gap模式 — 取更强者
+                gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+                    board, r, c, dr, dc, current_player
+                )
+                if gap_length > 0:
+                    gap_ptype = _get_pattern_type(gap_length, gap_open_ends)
+                    if gap_ptype > ptype:
+                        ptype = gap_ptype
 
                 if ptype == PATTERN_HALF_FOUR:
                     half_four_count += 1
@@ -634,7 +880,7 @@ def find_must_move(board, current_player):
             if open_three_count >= 2:
                 return (r * BOARD_SIZE + c, 7)
 
-    # 6. 对手双威胁检测
+    # 6. 对手双威胁检测 (V3: 包含gap模式)
     for r in range(BOARD_SIZE):
         for c in range(BOARD_SIZE):
             if board[r, c] != EMPTY:
@@ -646,8 +892,17 @@ def find_must_move(board, current_player):
             for d in range(NUM_DIRS):
                 dr = DIRECTIONS[d, 0]
                 dc = DIRECTIONS[d, 1]
+                # 连续模式
                 length, open_ends = _analyze_line_pattern(board, r, c, dr, dc, opponent)
                 ptype = _get_pattern_type(length, open_ends)
+                # gap模式 — 取更强者
+                gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+                    board, r, c, dr, dc, opponent
+                )
+                if gap_length > 0:
+                    gap_ptype = _get_pattern_type(gap_length, gap_open_ends)
+                    if gap_ptype > ptype:
+                        ptype = gap_ptype
 
                 if ptype == PATTERN_HALF_FOUR:
                     half_four_count += 1
@@ -663,14 +918,13 @@ def find_must_move(board, current_player):
     return (-1, 0)
 
 
-# ======================== 模式注入 MCTS 先验 (V2 增强) ========================
+# ======================== 模式注入 MCTS 先验 (V3 gap增强版) ========================
 
 @njit(cache=NUMBA_CACHE)
 def compute_pattern_prior_bonus(board, current_player):
     """
-    为每个合法着法计算基于棋型的先验加分 (V2)
-    ==========================================
-    增强双威胁加分, 更精确的攻守评分
+    为每个合法着法计算基于棋型的先验加分 (V3: 包含gap模式)
+    ====================================================
 
     返回: bonus[225] 数组
     """
@@ -694,9 +948,16 @@ def compute_pattern_prior_bonus(board, current_player):
                 dr = DIRECTIONS[d, 0]
                 dc = DIRECTIONS[d, 1]
 
-                # 己方棋型
+                # 己方棋型 (连续+gap取最强)
                 length, open_ends = _analyze_line_pattern(board, r, c, dr, dc, current_player)
                 ptype = _get_pattern_type(length, open_ends)
+                gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+                    board, r, c, dr, dc, current_player
+                )
+                if gap_length > 0:
+                    gap_ptype = _get_pattern_type(gap_length, gap_open_ends)
+                    if gap_ptype > ptype:
+                        ptype = gap_ptype
                 if ptype > my_best:
                     my_best = ptype
                 if ptype == PATTERN_HALF_FOUR:
@@ -704,9 +965,16 @@ def compute_pattern_prior_bonus(board, current_player):
                 elif ptype == PATTERN_OPEN_THREE:
                     my_open_three += 1
 
-                # 对手棋型
+                # 对手棋型 (连续+gap取最强)
                 length, open_ends = _analyze_line_pattern(board, r, c, dr, dc, opponent)
                 ptype = _get_pattern_type(length, open_ends)
+                gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+                    board, r, c, dr, dc, opponent
+                )
+                if gap_length > 0:
+                    gap_ptype = _get_pattern_type(gap_length, gap_open_ends)
+                    if gap_ptype > ptype:
+                        ptype = gap_ptype
                 if ptype > opp_best:
                     opp_best = ptype
                 if ptype == PATTERN_HALF_FOUR:
@@ -761,7 +1029,7 @@ def compute_pattern_prior_bonus(board, current_player):
 
 @njit(cache=NUMBA_CACHE)
 def compute_pattern_feature_channels(board, current_player):
-    """计算两个领域知识特征通道 (归一化到0-1)"""
+    """计算两个领域知识特征通道 (归一化到0-1, V3: 包含gap模式)"""
     my_channel = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
     opp_channel = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
     opponent = 3 - current_player
@@ -778,17 +1046,33 @@ def compute_pattern_feature_channels(board, current_player):
                 dr = DIRECTIONS[d, 0]
                 dc = DIRECTIONS[d, 1]
 
+                # 己方 (连续+gap取最强)
                 length, open_ends = _analyze_line_pattern(board, r, c, dr, dc, current_player)
                 ptype = _get_pattern_type(length, open_ends)
-                if ptype == PATTERN_FIVE:      my_score += 100.0
+                gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+                    board, r, c, dr, dc, current_player
+                )
+                if gap_length > 0:
+                    gap_ptype = _get_pattern_type(gap_length, gap_open_ends)
+                    if gap_ptype > ptype:
+                        ptype = gap_ptype
+                if ptype == PATTERN_FIVE:        my_score += 100.0
                 elif ptype == PATTERN_OPEN_FOUR: my_score += 50.0
                 elif ptype == PATTERN_HALF_FOUR: my_score += 10.0
                 elif ptype == PATTERN_OPEN_THREE: my_score += 5.0
                 elif ptype == PATTERN_HALF_THREE: my_score += 1.0
 
+                # 对手 (连续+gap取最强)
                 length, open_ends = _analyze_line_pattern(board, r, c, dr, dc, opponent)
                 ptype = _get_pattern_type(length, open_ends)
-                if ptype == PATTERN_FIVE:      opp_score += 100.0
+                gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
+                    board, r, c, dr, dc, opponent
+                )
+                if gap_length > 0:
+                    gap_ptype = _get_pattern_type(gap_length, gap_open_ends)
+                    if gap_ptype > ptype:
+                        ptype = gap_ptype
+                if ptype == PATTERN_FIVE:        opp_score += 100.0
                 elif ptype == PATTERN_OPEN_FOUR: opp_score += 50.0
                 elif ptype == PATTERN_HALF_FOUR: opp_score += 10.0
                 elif ptype == PATTERN_OPEN_THREE: opp_score += 5.0

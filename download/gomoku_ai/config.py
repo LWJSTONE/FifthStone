@@ -59,7 +59,7 @@ INITIAL_TEMPERATURE = 1.0
 
 # Undo-based MCTS (替代 Board.copy)
 # 注意: 实测 save/restore 快照方式比 Board.copy() 慢
-# 因为需要保存/恢复整个棋盘+pattern_count (两次copy)
+# 因为需要保存/恢复整个棋盘快照 (两次copy)
 # Board.copy() 只需一次 copy 且更简洁
 USE_UNDO_MCTS = False
 

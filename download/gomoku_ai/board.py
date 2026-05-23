@@ -2,13 +2,17 @@
 五子棋棋盘引擎 (V2 — 全面修复+优化版)
 ======================================
 V2 修复+优化:
-  1. 正确增量棋型计数 — 落子时减旧棋型+加新棋型, 撤销时逆操作
+  1. ~~增量棋型计数~~ — 已移除: pattern_count 从未被读取 (MCTS 使用 vct.py 的 compute_pattern_prior_bonus 从头计算)
   2. Numba JIT 编译 get_feature_planes — 热路径加速
   3. 预分配缓冲区 — _get_legal_moves 不再每次分配
   4. 邻居表扁平化 — Numba 可索引
   5. move_count 替代全盘扫描检查空棋盘
   6. np.argsort 替代冒泡排序
   7. Undo-based 接口 — 支持 MCTS 无需 Board.copy()
+
+注意: pattern_count 增量维护代码已移除, 因为该数组从未被任何模块读取。
+      MCTS 使用 vct.py 的 compute_pattern_prior_bonus() 从头计算棋型,
+      无需在 Board 中维护增量计数。
 """
 
 import numpy as np
@@ -314,50 +318,16 @@ def _compute_feature_planes_numba(board, move_history_r, move_history_c,
     return planes
 
 
-# ======================== 受影响位置计算 (增量棋型更新) ========================
-
-def _compute_affected_positions(board, r, c, color):
-    """
-    计算放置(r,c)后受影响的已有棋子位置
-    在4个方向上, 与(r,c)同色的连续棋子, 其棋型可能因新落子而改变
-    返回: set of (row, col, stone_color) 受影响需要更新棋型的位置
-    """
-    affected = set()
-    for d in range(NUM_DIRS):
-        dr, dc = int(DIRECTIONS[d, 0]), int(DIRECTIONS[d, 1])
-        # 正方向
-        nr, nc = r + dr, c + dc
-        while 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr, nc] != EMPTY:
-            affected.add((nr, nc, int(board[nr, nc])))
-            # 继续延伸到同色序列末尾的下一个棋子(如果其棋型也受影响)
-            nnr, nnc = nr + dr, nc + dc
-            if 0 <= nnr < BOARD_SIZE and 0 <= nnc < BOARD_SIZE and board[nnr, nnc] != EMPTY:
-                # 同方向的下一个不同色棋子也可能受影响(端点变化)
-                affected.add((nnr, nnc, int(board[nnr, nnc])))
-            nr += dr
-            nc += dc
-        # 反方向
-        nr, nc = r - dr, c - dc
-        while 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr, nc] != EMPTY:
-            affected.add((nr, nc, int(board[nr, nc])))
-            nnr, nnc = nr - dr, nc - dc
-            if 0 <= nnr < BOARD_SIZE and 0 <= nnc < BOARD_SIZE and board[nnr, nnc] != EMPTY:
-                affected.add((nnr, nnc, int(board[nnr, nnc])))
-            nr -= dr
-            nc -= dc
-    return affected
-
-
 # ======================== Python 层 Board 类 ========================
 
 class Board:
     """
     五子棋棋盘 (V2 — 全面修复版)
     ============================
-    修复:
-      - 增量棋型计数: 落子时先减受影响位置的旧棋型, 再加新棋型
-      - 撤销时: 先减新棋型, 再加回旧棋型
       - Undo-based 接口: 支持 save/restore 用于 MCTS
+
+    注意: pattern_count 增量棋型计数已移除 — 该数组从未被读取。
+          MCTS 通过 vct.py 的 compute_pattern_prior_bonus() 从头计算棋型。
     """
 
     def __init__(self):
@@ -372,8 +342,7 @@ class Board:
         self.game_over = False
         self.winner = 0
         self.move_count = 0
-        # 增量棋型计数 [3 colors][7 pattern types], index 0 unused
-        self.pattern_count = np.zeros((3, NUM_PATTERN_TYPES), dtype=np.int32)
+        # 注意: pattern_count 已移除 — 从未被任何模块读取, MCTS 使用 vct.py 从头计算
         # 预分配缓冲区
         self._legal_moves_buf = np.zeros(BOARD_SQUARES, dtype=np.int32)
         # 历史记录数组 (供 Numba 使用)
@@ -393,7 +362,6 @@ class Board:
         b.game_over = self.game_over
         b.winner = self.winner
         b.move_count = self.move_count
-        b.pattern_count = self.pattern_count.copy()
         b._legal_moves_buf = np.zeros(BOARD_SQUARES, dtype=np.int32)
         b._history_r = self._history_r.copy()
         b._history_c = self._history_c.copy()
@@ -404,7 +372,7 @@ class Board:
     def save_state(self):
         """保存当前状态 (用于 Undo-based MCTS, 比 copy() 轻量)"""
         # V2 优化: 直接保存棋盘快照 + 关键状态, 恢复时整块覆盖
-        # 比逐步undo+增量棋型计数快得多
+        # 比逐步undo快得多
         state = (
             self.board.copy(),           # 棋盘快照
             self.move_count,
@@ -412,7 +380,6 @@ class Board:
             self.zobrist_hash,
             self.game_over,
             self.winner,
-            self.pattern_count.copy(),
             len(self.move_history),      # 历史长度
         )
         self._save_stack.append(state)
@@ -426,7 +393,7 @@ class Board:
             return False
         state = self._save_stack.pop()
         (old_board, old_move_count, old_player, old_hash,
-         old_over, old_winner, old_patterns, old_hist_len) = state
+         old_over, old_winner, old_hist_len) = state
 
         # 直接覆盖棋盘 (比逐步undo快10×+)
         self.board[:] = old_board
@@ -435,7 +402,6 @@ class Board:
         self.zobrist_hash = old_hash
         self.game_over = old_over
         self.winner = old_winner
-        self.pattern_count[:] = old_patterns
 
         # 截断历史
         while len(self.move_history) > old_hist_len:
@@ -451,25 +417,17 @@ class Board:
         return True
 
     def place_stone(self, r, c):
-        """在(r,c)落子 — 含正确的增量棋型更新"""
+        """在(r,c)落子 — 不维护增量棋型计数 (pattern_count 已移除)"""
         if self.game_over or not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
             return False
         if self.board[r, c] != EMPTY:
             return False
 
         color = self.current_player
-
-        # V2: 正确增量棋型更新 — 先减受影响位置的旧棋型
-        self._remove_affected_patterns(r, c, color)
-
-        # 落子
         self.board[r, c] = color
         idx = r * BOARD_SIZE + c
         self.zobrist_hash ^= ZOBRIST_TABLE[idx, color - 1]
         self.zobrist_hash ^= ZOBRIST_TURN
-
-        # V2: 加新棋型 (含新落子和受影响的邻居)
-        self._add_new_patterns(r, c, color)
 
         self.move_history.append((r, c, color))
         self._history_r[self.move_count] = r
@@ -489,8 +447,7 @@ class Board:
 
     def place_stone_fast(self, r, c):
         """
-        V2: 快速落子 — 跳过增量棋型计数, 用于MCTS模拟
-        MCTS不需要 pattern_count, 省去大量 _compute_patterns_for_stone 调用
+        V2: 快速落子 — 用于MCTS模拟 (与 place_stone 等效, 保留向后兼容)
         """
         if self.game_over or not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
             return False
@@ -502,8 +459,6 @@ class Board:
         idx = r * BOARD_SIZE + c
         self.zobrist_hash ^= ZOBRIST_TABLE[idx, color - 1]
         self.zobrist_hash ^= ZOBRIST_TURN
-
-        # 不做增量棋型更新 — pattern_count 可能不准, 但MCTS不用它
 
         self.move_history.append((r, c, color))
         self._history_r[self.move_count] = r
@@ -522,152 +477,27 @@ class Board:
         return True
 
     def undo_stone(self):
-        """撤销最后一步 — 含正确的增量棋型恢复"""
+        """撤销最后一步 — 不维护增量棋型计数 (pattern_count 已移除)"""
         if not self.move_history:
             return False
         r, c, color = self.move_history.pop()
         self.move_count -= 1
 
-        # 先减当前棋型
-        self._remove_affected_patterns(r, c, color)
-        # 棋盘上移除
         self.board[r, c] = EMPTY
         idx = r * BOARD_SIZE + c
         self.zobrist_hash ^= ZOBRIST_TABLE[idx, color - 1]
         self.zobrist_hash ^= ZOBRIST_TURN
-        # 加回旧棋型
-        self._add_new_patterns_undo(r, c, color)
 
         self.current_player = color
         self.game_over = False
         self.winner = 0
         return True
 
-    def _remove_affected_patterns(self, r, c, color):
-        """
-        落子前: 减去受影响位置的旧棋型
-        受影响位置 = 在(r,c)的4个方向上, 与(r,c)连通的已有棋子
-        """
-        for d in range(NUM_DIRS):
-            dr, dc = int(DIRECTIONS[d, 0]), int(DIRECTIONS[d, 1])
-            # 正方向: 找到同色序列的起点(最远的同色棋子, 或方向上的第一个棋子)
-            self._remove_line_patterns_in_dir(r, c, dr, dc)
-            # 反方向
-            self._remove_line_patterns_in_dir(r, c, -dr, -dc)
-
-    def _remove_line_patterns_in_dir(self, r, c, dr, dc):
-        """沿(dr,dc)方向, 移除从(r,c)延伸出去的同色序列起点的旧棋型"""
-        # 找到这个方向上最远的连续同色棋子的起始位置
-        nr, nc = r + dr, c + dc
-        if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
-            return
-        stone_color = self.board[nr, nc]
-        if stone_color == EMPTY:
-            return
-        # 这个方向上有棋子, 其棋型可能因新落子而改变
-        # 找到序列的"起点"(反向最远的同色棋子)
-        sr, sc = nr, nc
-        while True:
-            pr, pc = sr - dr, sc - dc
-            if 0 <= pr < BOARD_SIZE and 0 <= pc < BOARD_SIZE and self.board[pr, pc] == stone_color:
-                sr, sc = pr, pc
-            else:
-                break
-        # 移除起点位置在该方向的旧棋型
-        patterns = _compute_patterns_for_stone(self.board, sr, sc, int(stone_color))
-        for d2 in range(NUM_DIRS):
-            pidx = patterns[d2]
-            if pidx >= 0:
-                self.pattern_count[int(stone_color), pidx] -= 1
-
-    def _add_new_patterns(self, r, c, color):
-        """落子后: 添加新棋型 (新落子 + 受影响的邻居序列起点)"""
-        opp = 3 - color
-        # 添加新落子位置的棋型
-        patterns = _compute_patterns_for_stone(self.board, r, c, int(color))
-        for d in range(NUM_DIRS):
-            pidx = patterns[d]
-            if pidx >= 0:
-                self.pattern_count[int(color), pidx] += 1
-
-        # 添加受影响邻居序列的新棋型
-        for d in range(NUM_DIRS):
-            dr, dc = int(DIRECTIONS[d, 0]), int(DIRECTIONS[d, 1])
-            self._add_line_patterns_in_dir(r, c, dr, dc)
-
-    def _add_line_patterns_in_dir(self, r, c, dr, dc):
-        """沿方向添加受影响序列的新棋型"""
-        nr, nc = r + dr, c + dc
-        if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
-            return
-        stone_color = self.board[nr, nc]
-        if stone_color == EMPTY:
-            return
-        # 找序列起点
-        sr, sc = nr, nc
-        while True:
-            pr, pc = sr - dr, sc - dc
-            if 0 <= pr < BOARD_SIZE and 0 <= pc < BOARD_SIZE and self.board[pr, pc] == stone_color:
-                sr, sc = pr, pc
-            else:
-                break
-        patterns = _compute_patterns_for_stone(self.board, sr, sc, int(stone_color))
-        for d2 in range(NUM_DIRS):
-            pidx = patterns[d2]
-            if pidx >= 0:
-                self.pattern_count[int(stone_color), pidx] += 1
-
-    def _add_new_patterns_undo(self, r, c, color):
-        """撤销落子后: 重新计算受影响区域的棋型 (简化: 全部重算受影响方向)"""
-        # 撤销后棋盘已恢复, 重新计算(r,c)4个方向上所有序列起点的棋型
-        for d in range(NUM_DIRS):
-            dr, dc = int(DIRECTIONS[d, 0]), int(DIRECTIONS[d, 1])
-            # 正方向
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and self.board[nr, nc] != EMPTY:
-                stone_c = int(self.board[nr, nc])
-                sr, sc = nr, nc
-                while True:
-                    pr, pc = sr - dr, sc - dc
-                    if 0 <= pr < BOARD_SIZE and 0 <= pc < BOARD_SIZE and self.board[pr, pc] == stone_c:
-                        sr, sc = pr, pc
-                    else:
-                        break
-                patterns = _compute_patterns_for_stone(self.board, sr, sc, stone_c)
-                for d2 in range(NUM_DIRS):
-                    pidx = patterns[d2]
-                    if pidx >= 0:
-                        self.pattern_count[stone_c, pidx] += 1
-            # 反方向
-            nr, nc = r - dr, c - dc
-            if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and self.board[nr, nc] != EMPTY:
-                stone_c = int(self.board[nr, nc])
-                sr, sc = nr, nc
-                while True:
-                    pr, pc = sr + dr, sc + dc  # 注意: 反方向起点的反向是正方向
-                    if 0 <= pr < BOARD_SIZE and 0 <= pc < BOARD_SIZE and self.board[pr, pc] == stone_c:
-                        sr, sc = pr, pc
-                    else:
-                        break
-                patterns = _compute_patterns_for_stone(self.board, sr, sc, stone_c)
-                for d2 in range(NUM_DIRS):
-                    pidx = patterns[d2]
-                    if pidx >= 0:
-                        self.pattern_count[stone_c, pidx] += 1
-
-    def _undo_patterns(self, r, c, color):
-        """撤销时先减去当前棋型 (在 board[r,c] 仍为 color 时调用)"""
-        # 减去(r,c)自身的棋型
-        patterns = _compute_patterns_for_stone(self.board, r, c, int(color))
-        for d in range(NUM_DIRS):
-            pidx = patterns[d]
-            if pidx >= 0:
-                self.pattern_count[int(color), pidx] -= 1
-        # 减去受影响邻居的棋型
-        for d in range(NUM_DIRS):
-            dr, dc = int(DIRECTIONS[d, 0]), int(DIRECTIONS[d, 1])
-            self._remove_line_patterns_in_dir(r, c, dr, dc)
-            self._remove_line_patterns_in_dir(r, c, -dr, -dc)
+    # [已移除] 以下增量棋型维护方法已删除, 因为 pattern_count 从未被读取:
+    #   _remove_affected_patterns, _remove_line_patterns_in_dir,
+    #   _add_new_patterns, _add_line_patterns_in_dir,
+    #   _add_new_patterns_undo, _undo_patterns
+    # MCTS 使用 vct.py 的 compute_pattern_prior_bonus() 从头计算棋型
 
     def get_legal_moves(self):
         """获取排序后的合法着法列表"""

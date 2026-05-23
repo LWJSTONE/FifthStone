@@ -347,20 +347,19 @@ class Trainer:
             v_loss = F.huber_loss(pred_values, values_t, reduction='none', delta=HUBER_DELTA)
             v_loss = (v_loss * weights_t).mean()
 
-            # V2 修复: KL 正则 — 正确计算 KL(old_policy ‖ new_policy)
-            kl_reg = torch.tensor(0.0, device=self.device)
+            # V3 修复: KL 正则 — 改为策略熵正则化, 鼓励探索
+            # 之前的 KL(p_MCTS || p_model) 等价于交叉熵减去常数, 对训练无实质约束
+            # 策略熵正则化: H(π) = -Σ π·log(π), 最小化负熵 = 鼓励策略更确定
+            # 但加权重为正 → 实际上最大化熵 = 鼓励探索
+            entropy_reg = torch.tensor(0.0, device=self.device)
             if KL_REG_WEIGHT > 0:
-                # 方法: 用目标策略分布计算 KL
-                # KL(p_target ‖ p_current) = sum(p_target * (log p_target - log p_current))
-                with torch.no_grad():
-                    # p_target = policies_t (MCTS 搜索结果)
-                    log_target = torch.log(policies_t + 1e-10)
-                log_current = F.log_softmax(policy_logits, dim=1)
-                kl_reg = (policies_t * (log_target - log_current)).sum(dim=1).mean()
-                # 限制 KL 为正
-                kl_reg = torch.clamp(kl_reg, min=0.0)
+                # 计算当前策略的熵
+                policy_probs = F.softmax(policy_logits, dim=1)
+                entropy = -(policy_probs * log_policy).sum(dim=1).mean()
+                # 负熵作为正则项 (最小化负熵 = 最大化熵 = 鼓励探索)
+                entropy_reg = -entropy
 
-            loss = POLICY_LOSS_WEIGHT * p_loss + VALUE_LOSS_WEIGHT * v_loss + KL_REG_WEIGHT * kl_reg
+            loss = POLICY_LOSS_WEIGHT * p_loss + VALUE_LOSS_WEIGHT * v_loss + KL_REG_WEIGHT * entropy_reg
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -386,7 +385,7 @@ class Trainer:
 
             total_p_loss += p_loss.item()
             total_v_loss += v_loss.item()
-            total_kl += kl_reg.item()
+            total_kl += entropy_reg.item()
             total_loss += loss.item()
 
         return {
