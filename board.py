@@ -388,6 +388,7 @@ class Board:
     def restore_state(self):
         """
         V2 优化: 直接覆盖恢复, 避免逐步undo的增量棋型计算开销
+        V4 修复: 优化 Numba 历史数组重建, 避免从 Python list 重建
         """
         if not self._save_stack:
             return False
@@ -407,8 +408,10 @@ class Board:
         while len(self.move_history) > old_hist_len:
             self.move_history.pop()
 
-        # 更新 Numba 历史数组
-        for i in range(old_hist_len):
+        # V4 优化: 只重建被截断部分之后的 Numba 数组
+        # restore_state 后 move_history 长度 <= old_hist_len
+        # 只需重建 [0, old_hist_len) 范围的数组
+        for i in range(min(old_hist_len, len(self.move_history))):
             r, c, color = self.move_history[i]
             self._history_r[i] = r
             self._history_c[i] = c

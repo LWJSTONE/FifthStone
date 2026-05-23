@@ -456,9 +456,16 @@ class Trainer:
                 draws += 1
 
         total = black_wins + white_wins + draws
-        # V2: 综合胜率 (不是只算黑胜)
-        wr = (black_wins + white_wins + 0.5 * draws) / max(1, total * 2) * 2
-        elo = max(0, -400 * np.log10(max(0.01, 1/max(0.01, min(0.99, wr)) - 1)) + 1000)
+        # V4 修复: 正确的综合胜率计算
+        # 黑白双方都由同一个模型控制, 胜率 = (总胜 + 0.5*平) / 总局数
+        wr = (black_wins + white_wins + 0.5 * draws) / max(1, total)
+        # ELO: 基于500分基准的估算
+        if wr >= 0.99:
+            elo = 2000
+        elif wr <= 0.01:
+            elo = 0
+        else:
+            elo = max(0, -400 * np.log10(1.0 / wr - 1) + 1000)
         return elo
 
     def save_checkpoint(self, path):

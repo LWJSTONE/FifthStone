@@ -248,4 +248,5 @@ for _i in range(BOARD_SIZE):
 # 着法紧迫度预排序: 按中心距离升序
 MOVE_ORDER_BY_CENTER = np.argsort(CENTER_DISTANCE).astype(np.int32)
 
-np.random.seed(42)
+# V4 修复: 移除全局 np.random.seed(42), 避免影响其他模块的随机性
+# Zobrist 表的确定性由 RandomState(42) 保证, 不需要全局种子

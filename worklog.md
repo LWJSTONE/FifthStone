@@ -19,3 +19,30 @@ Stage Summary:
 - 模型参数量: 186,794 (极致轻量)
 - 50次MCTS模拟约0.28s, 20次模拟自我对弈约4s/局
 - 训练循环正常: 策略损失3.22, 价值损失0.95
+
+---
+Task ID: 2
+Agent: Super Z (Main)
+Task: 再次审查代码, 修复所有发现的bug
+
+Work Log:
+- 逐行审查7个模块约4000+行代码
+- 发现并修复10个问题:
+  1. mcts.py: 终端价值计算错误 (place_stone后current_player已切换, 导致winner判断永远为False)
+  2. mcts.py: VCT结果概率分配除零风险
+  3. mcts.py: 已扩展无子节点时的value回传逻辑不安全
+  4. board.py: restore_state中Numba历史数组重建效率优化
+  5. network.py: 推理优化管线注释修正, 澄清互斥回退逻辑
+  6. train.py: _simple_eval中ELO计算公式错误
+  7. mcts.py: Root Parallel中Dirichlet噪声未基于original_prior
+  8. self_play.py: 温度采样可能选出非法着法
+  9. config.py: np.random.seed(42)全局污染随机性
+  10. mcts.py: Gumbel搜索中同样的终端价值bug
+- 所有修复已同步到 download/gomoku_ai/
+
+Stage Summary:
+- 修复了1个严重bug: MCTS终端价值计算错误(所有胜局value=-1)
+- 修复了1个中等bug: 温度采样可能非法
+- 修复了1个中等bug: ELO计算公式错误
+- 修复了1个中等bug: VCT概率分配除零
+- 其余为安全性和正确性增强

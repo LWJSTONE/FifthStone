@@ -345,7 +345,7 @@ def create_model(device='cpu', optimize_for_inference=False):
 
 
 def _optimize_for_inference(model):
-    """V2 推理优化: BN融合 → INT8量化 → TorchScript"""
+    """V4 推理优化: BN融合 → (INT8量化 或 TorchScript 或 torch.compile)"""
     model.eval()
 
     # 1. BN 融合 (最先执行, 后续优化基于融合后的模型)
@@ -355,6 +355,9 @@ def _optimize_for_inference(model):
             print("[Network] BN 融合成功")
         except Exception as e:
             print(f"[Network] BN 融合失败: {e}")
+
+    # V4 修复: 按优先级尝试, 第一个成功的即返回
+    # INT8动态量化对Conv2d的CPU支持有限, 先尝试, 失败则回退
 
     # 2. INT8 动态量化 (包含 Conv2d)
     if USE_INT8_QUANT:

@@ -246,10 +246,16 @@ class MCTS:
                 probs = np.zeros(BOARD_SQUARES, dtype=np.float32)
                 probs[vct_result] = 0.9
                 legal = board.get_legal_move_indices()
-                remaining = 0.1 / max(1, len(legal) - 1)
-                for idx in legal:
-                    if idx != vct_result:
-                        probs[idx] = remaining
+                # V4 修复: 安全的剩余概率分配, 避免除零
+                other_legal = [idx for idx in legal if idx != vct_result]
+                other_count = max(1, len(other_legal))
+                remaining = 0.1 / other_count
+                for idx in other_legal:
+                    probs[idx] = remaining
+                # 归一化防止浮点误差
+                psum = probs.sum()
+                if psum > 0:
+                    probs /= psum
                 return probs, 1.0
 
         # ===== 动态模拟次数 (V2: 基于上次搜索的策略熵) =====
@@ -351,10 +357,11 @@ class MCTS:
                     if board.winner == 0:
                         value = 0.0
                     else:
-                        # 最后一手是赢家下的, 此时 current_player 未切换
-                        # value 从落子者(赢家)视角为 +1.0
-                        # 回传时每步取反, 子节点 q_value 从父节点视角正确
-                        value = 1.0 if board.winner == board.current_player else -1.0
+                        # V4 修复: place_stone后 current_player 已切换到对手
+                        # board.winner 是刚落子的玩家(即 3 - board.current_player)
+                        # value 应从当前玩家(即刚落子的对手)视角返回
+                        last_player = 3 - board.current_player
+                        value = 1.0 if board.winner == last_player else -1.0
                     self._backpropagate(path, value)
                 else:
                     if not node.is_expanded:
@@ -374,10 +381,16 @@ class MCTS:
                             batch_paths.append(path)
                             batch_boards.append((board.board.copy(), board.current_player))
                     else:
-                        # V3 修复: 已扩展节点直接使用cached_value, 不做冗余推理
-                        # (网络在搜索过程中不变, 重复推理结果相同)
-                        value = node.cached_value if node.visit_count == 0 else node.q_value
-                        self._backpropagate(path, value)
+                        # V4 修复: 已扩展有子节点 → 正常选择(不应到达此处)
+                        # 已扩展无子节点 → 终局/死胡同, 用 q_value 回传
+                        if node.children:
+                            # 理论上不应到达这里: while循环会在children非空时继续
+                            # 安全起见跳过此模拟
+                            pass
+                        else:
+                            # 无子节点的已扩展节点: 终局或无合法着法
+                            value = node.q_value if node.visit_count > 0 else node.cached_value
+                            self._backpropagate(path, value)
 
                     # 批量推理
                     if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
@@ -409,7 +422,9 @@ class MCTS:
                     if sim_board.winner == 0:
                         value = 0.0
                     else:
-                        value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
+                        # V4 修复: place_stone后 current_player 已切换
+                        last_player = 3 - sim_board.current_player
+                        value = 1.0 if sim_board.winner == last_player else -1.0
                     self._backpropagate(path, value)
                 else:
                     if not node.is_expanded:
@@ -427,9 +442,10 @@ class MCTS:
                             batch_paths.append(path)
                             batch_boards.append((sim_board.board.copy(), sim_board.current_player))
                     else:
-                        # V3 修复: 已扩展节点直接使用cached_value, 不做冗余推理
-                        value = node.cached_value if node.visit_count == 0 else node.q_value
-                        self._backpropagate(path, value)
+                        # V4 修复: 已扩展无子节点
+                        if not node.children:
+                            value = node.q_value if node.visit_count > 0 else node.cached_value
+                            self._backpropagate(path, value)
 
                     if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
                         if batch_features:
@@ -521,7 +537,9 @@ class MCTS:
                                 if board.winner == 0:
                                     value = 0.0
                                 else:
-                                    value = 1.0 if board.winner == board.current_player else -1.0
+                                    # V4 修复: place_stone后 current_player 已切换
+                                    last_player = 3 - board.current_player
+                                    value = 1.0 if board.winner == last_player else -1.0
                                 self._backpropagate(path, value)
                             else:
                                 if not node.is_expanded:
@@ -553,7 +571,9 @@ class MCTS:
                                 if sim_board.winner == 0:
                                     value = 0.0
                                 else:
-                                    value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
+                                    # V4 修复
+                                    last_player = 3 - sim_board.current_player
+                                    value = 1.0 if sim_board.winner == last_player else -1.0
                                 self._backpropagate(path, value)
                             else:
                                 if not node.is_expanded:
@@ -618,7 +638,9 @@ class MCTS:
                         if board.winner == 0:
                             value = 0.0
                         else:
-                            value = 1.0 if board.winner == board.current_player else -1.0
+                            # V4 修复
+                            last_player = 3 - board.current_player
+                            value = 1.0 if board.winner == last_player else -1.0
                         self._backpropagate(path, value)
                     else:
                         if not node.is_expanded:
@@ -650,7 +672,9 @@ class MCTS:
                         if sim_board.winner == 0:
                             value = 0.0
                         else:
-                            value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
+                            # V4 修复
+                            last_player = 3 - sim_board.current_player
+                            value = 1.0 if sim_board.winner == last_player else -1.0
                         self._backpropagate(path, value)
                     else:
                         if not node.is_expanded:
@@ -712,7 +736,9 @@ class MCTS:
             if self.add_noise and tree_root.children:
                 noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(tree_root.children))
                 for i, (action, child) in enumerate(tree_root.children.items()):
-                    child.prior = (1 - DIRICHLET_EPSILON) * child.prior + DIRICHLET_EPSILON * noise[i]
+                    # V4 修复: 基于 original_prior 施加噪声, 防止累积
+                    base_prior = child.original_prior if child.original_prior > 0 else child.prior
+                    child.prior = (1 - DIRICHLET_EPSILON) * base_prior + DIRICHLET_EPSILON * noise[i]
 
             # 在子搜索中使用标准搜索 (不递归 root parallel)
             action_probs, _ = self._standard_search(board, tree_root, sims_per_tree)

@@ -303,7 +303,16 @@ def self_play_game(model, num_simulations=NUM_SIMULATIONS, add_noise=True,
         game_data.add_step(feature, action_probs)
 
         if step < TEMPERATURE_THRESHOLD and temperature > 0:
-            action = np.random.choice(BOARD_SQUARES, p=action_probs)
+            # V4 修复: 安全的温度采样 — 只在合法位置中采样
+            legal_indices = board.get_legal_move_indices()
+            legal_probs = action_probs[legal_indices]
+            legal_probs_sum = legal_probs.sum()
+            if legal_probs_sum > 0:
+                legal_probs = legal_probs / legal_probs_sum
+                choice_idx = np.random.choice(len(legal_indices), p=legal_probs)
+                action = legal_indices[choice_idx]
+            else:
+                action = np.argmax(action_probs)
         else:
             action = np.argmax(action_probs)
 
