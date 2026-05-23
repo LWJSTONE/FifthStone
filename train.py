@@ -469,10 +469,12 @@ class Trainer:
                         probs, _ = mcts_new.search(board)
                         action = np.argmax(probs)
                         mcts_new.advance(action)
+                        mcts_champ.advance(action)  # V13: 双方MCTS都需要推进
                     else:
                         probs, _ = mcts_champ.search(board)
                         action = np.argmax(probs)
                         mcts_champ.advance(action)
+                        mcts_new.advance(action)  # V13: 双方MCTS都需要推进
 
                     board.place_stone(*board.index_to_move(action))
 
@@ -517,6 +519,7 @@ class Trainer:
                         legal = board.get_legal_move_indices()
                         if legal:
                             action = legal[np.random.randint(len(legal))]
+                            mcts.advance(action)  # V13: 对手着法后也推进MCTS
                         else:
                             break
 

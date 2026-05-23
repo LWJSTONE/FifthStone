@@ -203,7 +203,6 @@ CHAMPION_WIN_RATE = 0.55
 # ======================== Numba JIT 配置 ========================
 NUMBA_CACHE = True
 NUMBA_FASTMATH = True
-NUMBA_PARALLEL = False         # Numba parallel 在小函数上开销大，默认关闭
 
 # ======================== 邻居表预计算 ========================
 NEIGHBOR_RADIUS = 2

@@ -343,8 +343,9 @@ def self_play_game(model, num_simulations=NUM_SIMULATIONS, add_noise=True,
 # ======================== 多进程 ========================
 
 def actor_worker(worker_id, model_state_dict, num_games, result_queue,
-                 num_simulations=NUM_SIMULATIONS, cpu_affinity=True):
-    """V2 Actor 工作进程 (含 CPU 亲和性)"""
+                 num_simulations=NUM_SIMULATIONS, cpu_affinity=True,
+                 opponent_state_dict=None):
+    """V2 Actor 工作进程 (含 CPU 亲和性 + V13 对手池支持)"""
     # CPU 亲和性绑定
     if USE_CPU_AFFINITY and cpu_affinity:
         try:
@@ -357,9 +358,21 @@ def actor_worker(worker_id, model_state_dict, num_games, result_queue,
     model.load_state_dict(model_state_dict)
     model.eval()  # V11 修复: 推理模式, 防止BatchNorm在训练模式下运行
 
+    # V13 修复: 多进程模式支持对手池
+    opponent_model = None
+    if opponent_state_dict is not None:
+        opponent_model = create_model(device='cpu')
+        opponent_model.load_state_dict(opponent_state_dict)
+        opponent_model.eval()
+
     games_played = 0
     while games_played < num_games:
-        game_data = self_play_game(model, num_simulations=num_simulations, add_noise=True)
+        # V13: 按比例决定是否使用对手模型
+        use_opp = (opponent_model is not None
+                   and np.random.random() < OPPONENT_POOL_GAME_RATIO)
+        opp = opponent_model if use_opp else None
+        game_data = self_play_game(model, num_simulations=num_simulations,
+                                   add_noise=True, opponent_model=opp)
         result_queue.put(pickle.dumps(game_data))
         games_played += 1
         if games_played % 3 == 0:
@@ -400,6 +413,12 @@ def generate_self_play_data(model, num_games=NUM_GAMES_PER_ITER, num_actors=NUM_
         return buffer
 
     # 多进程模式
+    # V13 修复: 序列化对手模型 state_dict 传递给子进程
+    opponent_state_dict = None
+    if USE_OPPONENT_POOL and opponent_pool and len(opponent_pool) > 0:
+        opponent_state = opponent_pool[np.random.randint(len(opponent_pool))]
+        opponent_state_dict = opponent_state  # state_dict 可直接 pickle
+
     games_per_actor = max(1, num_games // num_actors)
     processes = []
     result_queue = mp.Queue()
@@ -409,7 +428,8 @@ def generate_self_play_data(model, num_games=NUM_GAMES_PER_ITER, num_actors=NUM_
         if i == num_actors - 1:
             actor_games = num_games - games_per_actor * (num_actors - 1)
         p = mp.Process(target=actor_worker,
-                       args=(i, model_state_dict, actor_games, result_queue, NUM_SIMULATIONS))
+                       args=(i, model_state_dict, actor_games, result_queue,
+                             NUM_SIMULATIONS, True, opponent_state_dict))
         processes.append(p)
 
     for p in processes:

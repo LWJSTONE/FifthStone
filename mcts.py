@@ -46,10 +46,6 @@ V2 性能优化:
 import numpy as np
 import math
 from collections import defaultdict
-import multiprocessing as mp
-
-import torch
-import torch.nn.functional as F
 
 from config import (
     BOARD_SIZE, BOARD_SQUARES, NUM_SIMULATIONS,
@@ -72,6 +68,8 @@ from board import Board, EMPTY, BLACK, WHITE
 from vct import (
     find_must_move, vct_search, vcf_search, compute_pattern_prior_bonus
 )
+
+# V13: 移除未使用的 imports (multiprocessing, torch, torch.nn.functional)
 
 
 # ======================== Node Pool ========================
@@ -462,7 +460,8 @@ class MCTS:
                         value = 0.0
                     else:
                         # V12 修复: 从叶节点(下一个该走棋的玩家)视角
-                        value = -1.0 if sim_board.winner != 0 else 0.0
+                        # 此处已在 winner==0 的 else 分支, winner 必定 != 0
+                        value = -1.0
                     self._backpropagate(path, value)
                 else:
                     if not node.is_expanded:
@@ -591,8 +590,8 @@ class MCTS:
                                 if board.winner == 0:
                                     value = 0.0
                                 else:
-                                    # V12 修复: 从叶节点视角
-                                    value = -1.0 if board.winner != 0 else 0.0
+                                    # V12 修复: 从叶节点视角 (已在 winner!=0 分支)
+                                    value = -1.0
                                 self._backpropagate(path, value)
                             else:
                                 if not node.is_expanded:
@@ -630,8 +629,8 @@ class MCTS:
                                 if sim_board.winner == 0:
                                     value = 0.0
                                 else:
-                                    # V12 修复
-                                    value = -1.0 if sim_board.winner != 0 else 0.0
+                                    # V12 修复 (已在 winner!=0 分支)
+                                    value = -1.0
                                 self._backpropagate(path, value)
                             else:
                                 if not node.is_expanded:
@@ -701,8 +700,8 @@ class MCTS:
                         if board.winner == 0:
                             value = 0.0
                         else:
-                            # V12 修复
-                            value = -1.0 if board.winner != 0 else 0.0
+                            # V12 修复 (已在 winner!=0 分支)
+                            value = -1.0
                         self._backpropagate(path, value)
                     else:
                         if not node.is_expanded:
@@ -739,8 +738,8 @@ class MCTS:
                         if sim_board.winner == 0:
                             value = 0.0
                         else:
-                            # V12 修复
-                            value = -1.0 if sim_board.winner != 0 else 0.0
+                            # V12 修复 (已在 winner!=0 分支)
+                            value = -1.0
                         self._backpropagate(path, value)
                     else:
                         if not node.is_expanded:
@@ -895,9 +894,6 @@ class MCTS:
         if len(legal_indices) == 0:
             return
 
-        # V6 修复: 在模式注入之前保存网络原始prior
-        raw_policy = policy.copy()
-
         # V3: 模式注入 — 使用保存的 board 快照
         if USE_PATTERN_INJECTION and board_state is not None:
             pattern_bonus = compute_pattern_prior_bonus(board_state, current_player)
@@ -910,10 +906,12 @@ class MCTS:
                 if psum > 0:
                     policy /= psum
 
-        # 创建子节点 — V6: original_prior 使用网络原始prior (模式注入前)
+        # 创建子节点 — V13: original_prior 保存模式注入后的prior
         for idx in legal_indices:
             child = self._alloc_node(parent=node, action=int(idx), prior=policy[idx])
-            child.original_prior = raw_policy[idx]  # V6: 保存网络原始prior
+            # V13 修复: 保存模式注入后的prior, 而非原始网络输出
+            # 这样 Dirichlet 噪声施加时模式注入效果不会丢失
+            child.original_prior = policy[idx]  # 模式注入后的prior
             node.children[int(idx)] = child
 
         node.is_expanded = True
@@ -1010,9 +1008,6 @@ class MCTS:
         # V2: 缓存 value
         node.cached_value = value
 
-        # V6 修复: 在模式注入和转置表混合之前保存网络原始prior
-        raw_policy = policy.copy()
-
         # 模式注入: 混合棋型先验
         if USE_PATTERN_INJECTION:
             pattern_bonus = compute_pattern_prior_bonus(board.board, board.current_player)
@@ -1042,7 +1037,10 @@ class MCTS:
         for idx in legal_indices:
             idx_int = int(idx)
             child = self._alloc_node(parent=node, action=idx_int, prior=float(policy[idx]))
-            child.original_prior = float(raw_policy[idx])  # V6: 保存网络原始prior
+            # V13 修复: original_prior 应保存模式注入后的prior (而非原始网络输出)
+            # Dirichlet噪声施加时基于 original_prior, 如果保存的是原始网络输出
+            # 则每次重新施加噪声时模式注入效果被丢弃 (30%领域知识权重失效!)
+            child.original_prior = float(policy[idx])  # 模式注入后的prior
             node.children[idx_int] = child
 
         node.is_expanded = True

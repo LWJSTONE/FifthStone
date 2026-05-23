@@ -420,8 +420,10 @@ class Board:
             self._history_r[i] = r
             self._history_c[i] = c
             self._history_color[i] = color
-        # 清除超范围数据, 防止 get_feature_planes 读取陈旧数据
-        for i in range(hist_len, min(self.move_count + 1, BOARD_SQUARES)):
+        # V13 修复: 清除所有超范围数据, 防止 get_feature_planes 读取陈旧数据
+        # 之前只清除 move_count+1 位置(仅1个条目), 现在清除 hist_len 之后的所有条目
+        # 虽然 _compute_feature_planes_numba 只读取 0~move_count-1, 但防御性清除更安全
+        for i in range(hist_len, BOARD_SQUARES):
             self._history_r[i] = 0
             self._history_c[i] = 0
             self._history_color[i] = 0

@@ -327,7 +327,8 @@ class ONNXInferenceModel:
         x = np.stack(feature_list).astype(np.float32)
         results = self.session.run(None, {'input': x})
         policy_logits = results[0]
-        values = results[1].squeeze()
+        # V13 修复: squeeze(-1) 避免 batch_size=1 时过度压缩为 0-d 数组
+        values = results[1].reshape(-1)
         if legal_masks is not None:
             masks = np.stack(legal_masks).astype(np.float32)
             policy_logits = policy_logits + (1 - masks) * (-1e9)
@@ -410,7 +411,9 @@ def _optimize_for_inference(model):
         try:
             compiled = torch.compile(model, backend='inductor', mode='reduce-overhead')
             print("[Network] torch.compile 成功")
-            return compiled
+            # V12 修复: torch.compile 返回的模型没有 predict/predictBatch 方法,
+            # 必须用 InferenceWrapper 包装, 否则 MCTS 调用 model.predict() 会崩溃
+            return InferenceWrapper(compiled)
         except Exception as e:
             print(f"[Network] torch.compile 跳过 ({type(e).__name__})")
 
