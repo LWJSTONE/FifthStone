@@ -1,6 +1,11 @@
 """
-轻量化五子棋神经网络 (V2 — 全面修复+优化版)
+轻量化五子棋神经网络 (V8 — 推理优化修复版)
 ============================================
+V8 修复:
+  1. 调换 TorchScript 和 INT8 优先级 — TorchScript 优化整个计算图含 Conv2d,
+     对 Conv 密集型网络比 INT8 (仅量化 Linear) 更有效
+  2. EMA 评估用 try/finally 保护 (在 train.py 中)
+
 V2 修复:
   1. TorchScript 仅在推理时应用 (不干扰训练)
   2. BN 融合实际执行 (推理优化)
@@ -345,7 +350,11 @@ def create_model(device='cpu', optimize_for_inference=False):
 
 
 def _optimize_for_inference(model):
-    """V4 推理优化: BN融合 → (INT8量化 或 TorchScript 或 torch.compile)"""
+    """V8 推理优化: BN融合 → TorchScript → INT8量化 → torch.compile
+    V8 修复: 调换 TorchScript 和 INT8 优先级。
+    本网络 Conv2d 是计算瓶颈 (6个ResBlock, 深度可分离卷积),
+    TorchScript 能优化整个计算图含 Conv2d, 比 INT8 (仅量化Linear) 更有效。
+    """
     model.eval()
 
     # 1. BN 融合 (最先执行, 后续优化基于融合后的模型)
@@ -356,10 +365,22 @@ def _optimize_for_inference(model):
         except Exception as e:
             print(f"[Network] BN 融合失败: {e}")
 
-    # V4 修复: 按优先级尝试, 第一个成功的即返回
-    # INT8动态量化对Conv2d的CPU支持有限, 先尝试, 失败则回退
+    # V8: 按优先级尝试, 第一个成功的即返回
+    # 优先级: TorchScript (优化整个模型) > INT8 (仅Linear) > torch.compile
 
-    # 2. INT8 动态量化 (仅 Linear, CPU 上 quantize_dynamic 不支持 Conv2d)
+    # 2. TorchScript (优化整个计算图, 含 Conv2d)
+    if USE_TORCHSCRIPT:
+        try:
+            dummy_input = torch.randn(1, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+            if USE_NHWC:
+                dummy_input = dummy_input.to(memory_format=torch.channels_last)
+            traced = torch.jit.trace(model, dummy_input)
+            print("[Network] TorchScript trace 编译成功")
+            return traced
+        except Exception as e:
+            print(f"[Network] TorchScript 跳过 ({type(e).__name__})")
+
+    # 3. INT8 动态量化 (仅 Linear, CPU 上 quantize_dynamic 不支持 Conv2d)
     if USE_INT8_QUANT:
         try:
             quantized = torch.quantization.quantize_dynamic(
@@ -371,18 +392,6 @@ def _optimize_for_inference(model):
             return quantized
         except Exception as e:
             print(f"[Network] INT8 量化跳过 ({e})")
-
-    # 3. TorchScript (仅推理时)
-    if USE_TORCHSCRIPT:
-        try:
-            dummy_input = torch.randn(1, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
-            if USE_NHWC:
-                dummy_input = dummy_input.to(memory_format=torch.channels_last)
-            traced = torch.jit.trace(model, dummy_input)
-            print("[Network] TorchScript trace 编译成功")
-            return traced
-        except Exception as e:
-            print(f"[Network] TorchScript 跳过 ({type(e).__name__})")
 
     # 4. torch.compile (PyTorch 2.0+)
     if USE_TORCH_COMPILE:

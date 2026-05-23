@@ -1,6 +1,12 @@
 """
-深度优化 MCTS (V2 — 全面修复+优化版)
+深度优化 MCTS (V8 — PUCT符号修复版)
 ======================================
+V8 修复 (关键):
+  1. 修复 PUCT q_value 符号错误 — total_value 从节点自身视角存储,
+     PUCT 从父节点视角选择需取反 (-q_value)
+  2. 修复 RAVE rave_q 符号 — 同理需要在 PUCT 中取反 (-rave_q)
+  3. 修复 root_value 符号 — 子节点 q_value 取反为根节点视角
+
 V2 修复:
   1. 修复终端价值符号 (B1: winner==current_player → value=+1)
   2. 修复子树复用 (B4: advance后root已推进, search中直接使用)
@@ -167,7 +173,9 @@ class MCTSNode:
         return self.rave_value / self.rave_count
 
     def puct_score(self, sibling_q_min=0.0, sibling_q_max=1.0):
-        """PUCT 选择分数 (含 V2 Q-Normalization)"""
+        """PUCT 选择分数 (含 V2 Q-Normalization)
+        V8 修复: q_value 从节点自身视角存储, PUCT 从父节点视角选择, 需取反
+        """
         if self.parent is not None:
             parent_N = self.parent.visit_count + 1
             c = math.log((1 + parent_N + C_PUCT_BASE) / C_PUCT_BASE) + C_PUCT
@@ -177,16 +185,17 @@ class MCTSNode:
             sqrt_N = 1.0
 
         u = c * self.prior * sqrt_N / (1 + self.visit_count)
-        q = self.q_value
+        # V8 修复: total_value 从节点自身视角存储, PUCT 需要父节点视角, 故取反
+        q = -self.q_value
 
         # V2: Q-value Normalization
         if USE_Q_NORM and sibling_q_max > sibling_q_min:
             q = (q - sibling_q_min) / (sibling_q_max - sibling_q_min + 1e-8)
 
-        # RAVE 混合
+        # RAVE 混合 — V8: rave_q 同样需要取反
         if USE_RAVE and self.rave_count > 0:
             beta = RAVE_EQUIV / (RAVE_EQUIV + self.visit_count)
-            q = (1 - beta) * q + beta * self.rave_q
+            q = (1 - beta) * q + beta * (-self.rave_q)
 
         vl = self.virtual_loss * VIRTUAL_LOSS / (self.visit_count + 1)
         return q + u - vl
@@ -492,13 +501,12 @@ class MCTS:
             for action, prob in zip(actions, probs):
                 action_probs[action] = prob
 
-        # V3 修复: root_value 必须从子节点的 q_value 加权计算
-        # root.q_value 的符号取决于路径奇偶性, 不可靠
+        # V8 修复: root_value 从子节点视角取反为根节点视角
         root_value = 0.0
         if root.children:
             total_child_visits = sum(c.visit_count for c in root.children.values())
             if total_child_visits > 0:
-                root_value = sum(c.visit_count * c.q_value
+                root_value = sum(c.visit_count * (-c.q_value)
                                  for c in root.children.values()) / total_child_visits
         return action_probs, root_value
 
@@ -724,12 +732,12 @@ class MCTS:
             for action, prob in zip(actions, probs):
                 action_probs[action] = prob
 
-        # V3 修复: root_value 从子节点计算
+        # V8 修复: root_value 从子节点视角取反为根节点视角
         root_value = 0.0
         if root.children:
             total_child_visits = sum(c.visit_count for c in root.children.values())
             if total_child_visits > 0:
-                root_value = sum(c.visit_count * c.q_value
+                root_value = sum(c.visit_count * (-c.q_value)
                                  for c in root.children.values()) / total_child_visits
         return action_probs, root_value
 
@@ -770,12 +778,12 @@ class MCTS:
         # V3 修复: 更新 self.root 为最后一棵树的 root, 保持子树复用能力
         self.root = tree_root
 
-        # V6 修复: 从最后一棵树的 root 计算 root_value (原 root 未被搜索)
+        # V8 修复: 从最后一棵树的 root 计算 root_value (取反为父节点视角)
         root_value = 0.0
         if tree_root.children:
             total_child_visits = sum(c.visit_count for c in tree_root.children.values())
             if total_child_visits > 0:
-                root_value = sum(c.visit_count * c.q_value
+                root_value = sum(c.visit_count * (-c.q_value)
                                  for c in tree_root.children.values()) / total_child_visits
         return action_probs, root_value
 
@@ -855,13 +863,13 @@ class MCTS:
 
     def _select_child(self, node):
         """PUCT 选择 (含 Q-Normalization)"""
-        # V2: 计算 Q 值范围用于归一化
+        # V8 修复: 计算 Q 值范围用于归一化 — 使用父节点视角(取反)
         q_min = float('inf')
         q_max = float('-inf')
         if USE_Q_NORM:
             for child in node.children.values():
                 if child.visit_count > 0:
-                    q = child.q_value
+                    q = -child.q_value  # V8: 取反转为父节点视角
                     if q < q_min: q_min = q
                     if q > q_max: q_max = q
             if q_min == float('inf'):
@@ -889,7 +897,7 @@ class MCTS:
         if USE_Q_NORM:
             for _, child in children_list:
                 if child.visit_count > 0:
-                    q = child.q_value
+                    q = -child.q_value  # V8: 取反转为父节点视角
                     if q < q_min: q_min = q
                     if q > q_max: q_max = q
             if q_min == float('inf'):

@@ -275,7 +275,6 @@ def self_play_game(model, num_simulations=NUM_SIMULATIONS, add_noise=True,
 
     # V2: Resign 机制
     recent_values = []  # V6: 只记录当前模型视角的 value
-    last_model_player = BLACK  # V6: 追踪当前模型执子颜色
 
     for step in range(MAX_GAME_LENGTH):
         # 选择使用哪个模型

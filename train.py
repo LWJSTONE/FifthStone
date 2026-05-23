@@ -424,93 +424,98 @@ class Trainer:
         }
 
     def _champion_eval(self):
-        """新旧模型对弈评估 — V7: 使用EMA模型评估"""
+        """新旧模型对弈评估 — V8: 使用EMA模型评估 + try/finally保护"""
         if self.champion_model is None:
             return 0.5
 
-        # V7: 评估时使用 EMA 模型 (更稳定)
+        # V8: 评估时使用 EMA 模型 (更稳定), 用 try/finally 确保恢复
         eval_model = self.model
+        ema_applied = False
         if USE_EMA and self.ema_model is not None:
             self.ema_model.apply(self.model)
             eval_model = self.model  # EMA 权重已应用到 self.model
+            ema_applied = True
 
-        wins = draws = losses = 0
-        eval_sims = max(50, NUM_SIMULATIONS // 4)
+        try:
+            wins = draws = losses = 0
+            eval_sims = max(50, NUM_SIMULATIONS // 4)
 
-        for game_idx in range(min(EVAL_GAMES, 10)):
-            board = Board()
-            new_is_black = (game_idx % 2 == 0)
-            new_color = BLACK if new_is_black else WHITE
+            for game_idx in range(min(EVAL_GAMES, 10)):
+                board = Board()
+                new_is_black = (game_idx % 2 == 0)
+                new_color = BLACK if new_is_black else WHITE
 
-            mcts_new = MCTS(eval_model, num_simulations=eval_sims, add_noise=False, temperature=0.0)
-            mcts_champ = MCTS(self.champion_model, num_simulations=eval_sims, add_noise=False, temperature=0.0)
+                mcts_new = MCTS(eval_model, num_simulations=eval_sims, add_noise=False, temperature=0.0)
+                mcts_champ = MCTS(self.champion_model, num_simulations=eval_sims, add_noise=False, temperature=0.0)
 
-            while not board.game_over and board.move_count < MAX_MOVES:
-                if board.current_player == new_color:
-                    probs, _ = mcts_new.search(board)
-                    action = np.argmax(probs)
-                    mcts_new.advance(action)
+                while not board.game_over and board.move_count < MAX_MOVES:
+                    if board.current_player == new_color:
+                        probs, _ = mcts_new.search(board)
+                        action = np.argmax(probs)
+                        mcts_new.advance(action)
+                    else:
+                        probs, _ = mcts_champ.search(board)
+                        action = np.argmax(probs)
+                        mcts_champ.advance(action)
+
+                    board.place_stone(*board.index_to_move(action))
+
+                if board.winner == 0:
+                    draws += 1
+                elif board.winner == new_color:
+                    wins += 1
                 else:
-                    probs, _ = mcts_champ.search(board)
-                    action = np.argmax(probs)
-                    mcts_champ.advance(action)
-
-                board.place_stone(*board.index_to_move(action))
-
-            if board.winner == 0:
-                draws += 1
-            elif board.winner == new_color:
-                wins += 1
-            else:
-                losses += 1
-
-        # V7: 评估后恢复原始权重
-        if USE_EMA and self.ema_model is not None:
-            self.ema_model.restore(self.model)
+                    losses += 1
+        finally:
+            # V8: try/finally 确保即使异常也恢复原始权重
+            if ema_applied:
+                self.ema_model.restore(self.model)
 
         total = wins + draws + losses
         return (wins + 0.5 * draws) / max(1, total)
 
     def _simple_eval(self):
-        """V7 修复: 与随机基线对弈评估 — 使用EMA模型"""
-        # V7: 评估时使用 EMA 模型
+        """V8 修复: 与随机基线对弈评估 — 使用EMA模型 + try/finally保护"""
+        ema_applied = False
         if USE_EMA and self.ema_model is not None:
             self.ema_model.apply(self.model)
+            ema_applied = True
 
-        self.model.eval()
-        wins = draws = losses = 0
-        n_games = min(EVAL_GAMES, 6)
+        try:
+            self.model.eval()
+            wins = draws = losses = 0
+            n_games = min(EVAL_GAMES, 6)
 
-        for game_idx in range(n_games):
-            board = Board()
-            model_color = BLACK if game_idx % 2 == 0 else WHITE
-            mcts = MCTS(self.model, num_simulations=max(50, NUM_SIMULATIONS // 4),
-                        add_noise=False, temperature=0.0)
+            for game_idx in range(n_games):
+                board = Board()
+                model_color = BLACK if game_idx % 2 == 0 else WHITE
+                mcts = MCTS(self.model, num_simulations=max(50, NUM_SIMULATIONS // 4),
+                            add_noise=False, temperature=0.0)
 
-            while not board.game_over and board.move_count < MAX_MOVES:
-                if board.current_player == model_color:
-                    probs, _ = mcts.search(board)
-                    action = np.argmax(probs)
-                    mcts.advance(action)
-                else:
-                    legal = board.get_legal_move_indices()
-                    if legal:
-                        action = legal[np.random.randint(len(legal))]
+                while not board.game_over and board.move_count < MAX_MOVES:
+                    if board.current_player == model_color:
+                        probs, _ = mcts.search(board)
+                        action = np.argmax(probs)
+                        mcts.advance(action)
                     else:
-                        break
+                        legal = board.get_legal_move_indices()
+                        if legal:
+                            action = legal[np.random.randint(len(legal))]
+                        else:
+                            break
 
-                board.place_stone(*board.index_to_move(action))
+                    board.place_stone(*board.index_to_move(action))
 
-            if board.winner == 0:
-                draws += 1
-            elif board.winner == model_color:
-                wins += 1
-            else:
-                losses += 1
-
-        # V7: 评估后恢复原始权重
-        if USE_EMA and self.ema_model is not None:
-            self.ema_model.restore(self.model)
+                if board.winner == 0:
+                    draws += 1
+                elif board.winner == model_color:
+                    wins += 1
+                else:
+                    losses += 1
+        finally:
+            # V8: try/finally 确保即使异常也恢复原始权重
+            if ema_applied:
+                self.ema_model.restore(self.model)
 
         total = wins + draws + losses
         wr = (wins + 0.5 * draws) / max(1, total)
