@@ -563,6 +563,7 @@ class Trainer:
         }
         if USE_SWA and self.swa_model is not None:
             data['swa_state_dict'] = self.swa_model.state_dict()
+            data['swa_started'] = self.swa_started  # V14 修复: 保存SWA状态标志
         if USE_EMA and self.ema_model is not None:
             data['ema_shadow'] = self.ema_model.shadow
         if USE_OPPONENT_POOL and self.opponent_pool is not None:
@@ -595,6 +596,7 @@ class Trainer:
             self.history = defaultdict(list, ckpt['history'])
         if USE_SWA and self.swa_model is not None and 'swa_state_dict' in ckpt:
             self.swa_model.load_state_dict(ckpt['swa_state_dict'])
+            self.swa_started = ckpt.get('swa_started', False)  # V14 修复: 恢复SWA状态标志
         if USE_EMA and self.ema_model is not None and 'ema_shadow' in ckpt:
             self.ema_model.shadow = ckpt['ema_shadow']
         if USE_OPPONENT_POOL and 'opponent_pool' in ckpt:
