@@ -391,18 +391,6 @@ class MCTS:
                             value = node.q_value if node.visit_count > 0 else node.cached_value
                             self._backpropagate(path, value)
 
-                    # 批量推理 (达到批量大小或最后一次模拟时刷新)
-                    if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
-                        if batch_features:
-                            self._batch_inference(batch_features, batch_masks,
-                                                  batch_nodes, batch_paths, batch_boards)
-                            batch_features.clear()
-                            batch_masks.clear()
-                            batch_nodes.clear()
-                            batch_paths.clear()
-                            batch_boards.clear()
-                            pending_node_ids.clear()
-
                 # Undo
                 board.restore_state()
 
@@ -451,21 +439,28 @@ class MCTS:
                             value = node.q_value if node.visit_count > 0 else node.cached_value
                             self._backpropagate(path, value)
 
-                    if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
-                        if batch_features:
-                            self._batch_inference(batch_features, batch_masks,
-                                                  batch_nodes, batch_paths, batch_boards)
-                            batch_features.clear()
-                            batch_masks.clear()
-                            batch_nodes.clear()
-                            batch_paths.clear()
-                            batch_boards.clear()
-                            pending_node_ids.clear()
+            # V6 修复: 批量推理刷新移到 if/else 之外, 确保 game_over 时也能刷新
+            if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
+                if batch_features:
+                    self._batch_inference(batch_features, batch_masks,
+                                          batch_nodes, batch_paths, batch_boards)
+                    batch_features.clear()
+                    batch_masks.clear()
+                    batch_nodes.clear()
+                    batch_paths.clear()
+                    batch_boards.clear()
+                    pending_node_ids.clear()
 
-            # 提前终止
+            # 提前终止 — V6 修复: 先刷新批量再 break
             if sim > num_sims // 2 and root.visit_count > 10 and root.children:
                 best_v = max(c.visit_count for c in root.children.values())
                 if best_v > sim * 0.65:
+                    if batch_features:
+                        self._batch_inference(batch_features, batch_masks,
+                                              batch_nodes, batch_paths, batch_boards)
+                        batch_features.clear(); batch_masks.clear()
+                        batch_nodes.clear(); batch_paths.clear()
+                        batch_boards.clear(); pending_node_ids.clear()
                     break
 
         # 生成动作概率
@@ -762,13 +757,13 @@ class MCTS:
         # V3 修复: 更新 self.root 为最后一棵树的 root, 保持子树复用能力
         self.root = tree_root
 
-        # V3 修复: 从子节点计算 root_value
+        # V6 修复: 从最后一棵树的 root 计算 root_value (原 root 未被搜索)
         root_value = 0.0
-        if root.children:
-            total_child_visits = sum(c.visit_count for c in root.children.values())
+        if tree_root.children:
+            total_child_visits = sum(c.visit_count for c in tree_root.children.values())
             if total_child_visits > 0:
                 root_value = sum(c.visit_count * c.q_value
-                                 for c in root.children.values()) / total_child_visits
+                                 for c in tree_root.children.values()) / total_child_visits
         return action_probs, root_value
 
     def _batch_inference(self, features, masks, nodes, paths, boards=None):
@@ -781,11 +776,18 @@ class MCTS:
             # 单样本直接推理
             policy, value = self.model.predict(features[0], masks[0])
             node = nodes[0]
+            # V6 修复: 与多样本路径一致, 检查节点是否已被扩展
             if not node.is_expanded and boards is not None and boards[0] is not None:
                 board_state, current_player = boards[0]
                 self._expand_node_with_policy(node, policy, masks[0], board_state, current_player)
                 node.cached_value = float(value)
-            self._backpropagate(paths[0], float(value))
+                self._backpropagate(paths[0], float(value))
+            elif node.is_expanded:
+                # V6: 节点已被其他路径扩展 — 用缓存值回传, 防止双重计数
+                self._backpropagate(paths[0], node.cached_value)
+            else:
+                # boards 为 None — 无法扩展, 直接回传推理值
+                self._backpropagate(paths[0], float(value))
             return
 
         # 批量推理
@@ -806,13 +808,16 @@ class MCTS:
                 self._backpropagate(paths[i], float(values[i]))
 
     def _expand_node_with_policy(self, node, policy, legal_mask, board_state, current_player):
-        """使用已有 policy 扩展节点 (避免重复推理) — V3: 支持模式注入"""
+        """使用已有 policy 扩展节点 (避免重复推理) — V6: 保存网络原始prior"""
         if node.is_expanded:
             return
 
         legal_indices = np.where(legal_mask > 0.5)[0]
         if len(legal_indices) == 0:
             return
+
+        # V6 修复: 在模式注入之前保存网络原始prior
+        raw_policy = policy.copy()
 
         # V3: 模式注入 — 使用保存的 board 快照
         if USE_PATTERN_INJECTION and board_state is not None:
@@ -826,10 +831,10 @@ class MCTS:
                 if psum > 0:
                     policy /= psum
 
-        # 创建子节点 — V3: 保存网络原始prior
+        # 创建子节点 — V6: original_prior 使用网络原始prior (模式注入前)
         for idx in legal_indices:
             child = self._alloc_node(parent=node, action=int(idx), prior=policy[idx])
-            child.original_prior = policy[idx]  # V3: 保存原始prior
+            child.original_prior = raw_policy[idx]  # V6: 保存网络原始prior
             node.children[int(idx)] = child
 
         node.is_expanded = True
@@ -919,6 +924,9 @@ class MCTS:
         # V2: 缓存 value
         node.cached_value = value
 
+        # V6 修复: 在模式注入和转置表混合之前保存网络原始prior
+        raw_policy = policy.copy()
+
         # 模式注入: 混合棋型先验
         if USE_PATTERN_INJECTION:
             pattern_bonus = compute_pattern_prior_bonus(board.board, board.current_player)
@@ -944,10 +952,10 @@ class MCTS:
                     if psum > 0:
                         policy /= psum
 
-        # 创建子节点 — V3: 保存网络原始prior
+        # 创建子节点 — V6: original_prior 使用网络原始prior (模式注入前)
         for idx in legal_indices:
             child = self._alloc_node(parent=node, action=idx, prior=policy[idx])
-            child.original_prior = policy[idx]  # V3: 保存原始prior
+            child.original_prior = raw_policy[idx]  # V6: 保存网络原始prior
             node.children[idx] = child
 
         node.is_expanded = True
@@ -960,9 +968,8 @@ class MCTS:
         return value
 
     def _backpropagate(self, path, value):
-        """回传价值 + RAVE (V5: 修复RAVE只使用子树动作)"""
-        # V5 修复: RAVE 只应使用当前节点子树中的动作, 而非整条路径
-        # 从叶子向根遍历时, 逐步添加已处理节点的动作到子树集合
+        """回传价值 + RAVE (V6: 修复RAVE价值符号)"""
+        # RAVE 只应使用当前节点子树中的动作, 而非整条路径
         subtree_actions = set() if USE_RAVE else None
 
         for node in reversed(path):
@@ -973,12 +980,17 @@ class MCTS:
                 node.parent.sqrt_N = math.sqrt(node.parent.visit_count + 1)
 
             if USE_RAVE:
-                # 只用子树内的动作更新 RAVE
+                # V6 修复: RAVE value 应从父节点视角计算
+                # 当前 value 是从当前节点的父节点视角的 (即该节点的q_value的视角)
+                # 但子节点的 rave_value 应该从子节点的父节点(=当前节点)视角计算
+                # 所以需要使用 -value (因为 value 在上一层被取反了)
                 for action in subtree_actions:
                     if action in node.children and action != node.action:
                         child = node.children[action]
                         child.rave_count += 1
-                        child.rave_value += value
+                        # V6 修复: 使用 -value, 因为 value 此时的视角是当前节点的父节点,
+                        # 而子节点的 rave_value 应该从当前节点(子节点的父节点)的视角
+                        child.rave_value += -value
                 # 当前节点的动作属于其父节点的子树
                 if node.action is not None:
                     subtree_actions.add(node.action)

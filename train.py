@@ -46,7 +46,7 @@ from config import (
     USE_EMA, EMA_DECAY,
     USE_OPPONENT_POOL, OPPONENT_POOL_SIZE,
     USE_PROGRESSIVE_SIMS, PROGRESSIVE_SIMS_SCHEDULE,
-    PRIORITY_ALPHA,
+    PRIORITY_ALPHA, USE_SUMTREE,
 )
 from network import create_model, create_inference_model
 from self_play import generate_self_play_data, self_play_game, ReplayBuffer
@@ -282,19 +282,46 @@ class Trainer:
         print(f"\n训练完成! 最佳ELO: {self.best_elo:.0f}")
 
     def _swa_finalize(self):
-        """V2 修复: SWA 终结化 — 使用回放缓冲区数据更新 BN"""
+        """V6 修复: SWA 终结化 — 正确更新 BN 统计 (需 train 模式)"""
         print("[SWA] 终结化: 更新 BN 统计...")
-        self.swa_model.eval()
 
-        # 从回放缓冲区采样数据更新 BN
-        sample = self.replay_buffer.sample(min(256, len(self.replay_buffer)))
-        if sample is not None:
-            states, _, _, _, _ = sample
-            states_t = torch.from_numpy(states).to(self.device)
-            with torch.no_grad():
-                # 前向传播更新 BN running_mean/running_var
-                self.swa_model(states_t)
-        print("[SWA] BN 更新完成")
+        # V6 修复: 使用 torch.optim.swa_utils.update_bn 正式接口
+        # 而非手动 forward (eval模式下BN不更新统计)
+        try:
+            from torch.optim.swa_utils import update_bn
+
+            # 创建一个简单的 dataloader 从回放缓冲区采样
+            sample = self.replay_buffer.sample(min(256, len(self.replay_buffer)))
+            if sample is not None:
+                states, _, _, _, _ = sample
+                states_t = torch.from_numpy(states).to(self.device)
+
+                # update_bn 需要 loader, 创建一个单批次的简易 loader
+                class _SimpleLoader:
+                    def __init__(self, data):
+                        self.data = [data]
+                    def __iter__(self):
+                        for d in self.data:
+                            yield d
+                    def __len__(self):
+                        return 1
+
+                loader = _SimpleLoader(states_t)
+                update_bn(loader, self.swa_model, device=self.device)
+            print("[SWA] BN 更新完成 (使用 update_bn)")
+        except (ImportError, Exception) as e:
+            # 回退: 手动在 train 模式下前向传播更新 BN
+            print(f"[SWA] update_bn 不可用 ({e}), 使用手动更新")
+            # V6 关键: 必须在 train 模式下才能更新 BN running_mean/running_var
+            self.swa_model.train()
+            sample = self.replay_buffer.sample(min(256, len(self.replay_buffer)))
+            if sample is not None:
+                states, _, _, _, _ = sample
+                states_t = torch.from_numpy(states).to(self.device)
+                with torch.no_grad():
+                    self.swa_model(states_t)
+            self.swa_model.eval()
+            print("[SWA] BN 更新完成 (手动模式)")
 
     def _curriculum_phase(self):
         """

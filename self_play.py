@@ -274,7 +274,8 @@ def self_play_game(model, num_simulations=NUM_SIMULATIONS, add_noise=True,
                              add_noise=add_noise)
 
     # V2: Resign 机制
-    recent_values = []
+    recent_values = []  # V6: 只记录当前模型视角的 value
+    last_model_player = BLACK  # V6: 追踪当前模型执子颜色
 
     for step in range(MAX_GAME_LENGTH):
         # 选择使用哪个模型
@@ -289,15 +290,18 @@ def self_play_game(model, num_simulations=NUM_SIMULATIONS, add_noise=True,
         active_mcts.temperature = temperature
         action_probs, root_value = active_mcts.search(board)
 
-        # V2: Resign 检测
+        # V2: Resign 检测 — V6 修复: 只在当前模型视角时检查
         if USE_RESIGN and step > 10:
-            recent_values.append(root_value)
-            if len(recent_values) > RESIGN_CHECK_STEPS:
-                recent_values.pop(0)
-                if all(v < RESIGN_THRESHOLD for v in recent_values):
-                    # 提前认输
-                    game_data.set_winner(3 - board.current_player)
-                    break
+            # V6: 只在当前模型执子时记录 value
+            is_model_turn = (mcts_opponent is None or board.current_player == BLACK)
+            if is_model_turn:
+                recent_values.append(root_value)
+                if len(recent_values) > RESIGN_CHECK_STEPS:
+                    recent_values.pop(0)
+                    if all(v < RESIGN_THRESHOLD for v in recent_values):
+                        # 提前认输
+                        game_data.set_winner(3 - board.current_player)
+                        break
 
         feature = board.get_feature_planes()
         game_data.add_step(feature, action_probs)
