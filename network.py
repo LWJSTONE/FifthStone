@@ -259,8 +259,9 @@ def fuse_bn_for_model(model):
         conv0 = model.input_conv[0]
         bn1 = model.input_conv[1]
         fused = fuse_bn(conv0, bn1)
-        model.input_conv[0] = fused
-        model.input_conv[1] = nn.Identity()
+        # V9 修复: nn.Sequential 不支持直接赋值, 必须重建
+        relu2 = model.input_conv[2] if len(model.input_conv) > 2 else nn.ReLU(inplace=True)
+        model.input_conv = nn.Sequential(fused, nn.Identity(), relu2)
 
     return model
 

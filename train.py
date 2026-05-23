@@ -249,7 +249,15 @@ class Trainer:
                 print("[3/3] 评估...")
                 if USE_CHAMPION_EVAL and self.champion_model is not None:
                     win_rate = self._champion_eval()
-                    elo = max(0, -400 * np.log10(max(0.01, 1/max(0.01, win_rate) - 1)) + 1000) if win_rate > 0.5 else 0
+                    # V9 修复: ELO公式 — 相对champion的ELO差值
+                    # 当 win_rate=0.5 时 ELO差=0, win_rate>0.5 时为正
+                    if win_rate > 0 and win_rate < 1:
+                        elo_diff = -400 * np.log10(1.0 / win_rate - 1)
+                    elif win_rate >= 1:
+                        elo_diff = 800
+                    else:
+                        elo_diff = -800
+                    elo = self.best_elo + elo_diff
                     print(f"  vs Champion 胜率: {win_rate:.1%}, ELO≈{elo:.0f}")
 
                     if win_rate >= CHAMPION_WIN_RATE:
@@ -519,13 +527,15 @@ class Trainer:
 
         total = wins + draws + losses
         wr = (wins + 0.5 * draws) / max(1, total)
-        # ELO: 基于对随机基线胜率的估算 (随机≈0 ELO)
+        # V9 修复: ELO估算 — 相对随机基线(0 ELO)
+        # 标准公式: ELO_diff = -400 * log10(1/wr - 1)
+        # 当 wr=0.5 时 ELO_diff=0, 对随机基线几乎必胜时约800+
         if wr >= 0.99:
-            elo = 1500
+            elo = 800
         elif wr <= 0.01:
-            elo = 0
+            elo = 0  # 对随机基线几乎全负, 估算为0
         else:
-            elo = max(0, -400 * np.log10(1.0 / wr - 1) + 500)
+            elo = max(0, -400 * np.log10(1.0 / wr - 1))
         return elo
 
     def save_checkpoint(self, path):

@@ -408,14 +408,19 @@ class Board:
         while len(self.move_history) > old_hist_len:
             self.move_history.pop()
 
-        # V4 优化: 只重建被截断部分之后的 Numba 数组
-        # restore_state 后 move_history 长度 <= old_hist_len
-        # 只需重建 [0, old_hist_len) 范围的数组
-        for i in range(min(old_hist_len, len(self.move_history))):
+        # V5 修复: 重建 Numba 历史数组 + 清除超范围数据
+        # restore_state 后 move_history 长度应 == old_hist_len
+        hist_len = min(old_hist_len, len(self.move_history))
+        for i in range(hist_len):
             r, c, color = self.move_history[i]
             self._history_r[i] = r
             self._history_c[i] = c
             self._history_color[i] = color
+        # 清除超范围数据, 防止 get_feature_planes 读取陈旧数据
+        for i in range(hist_len, min(self.move_count + 1, BOARD_SQUARES)):
+            self._history_r[i] = 0
+            self._history_c[i] = 0
+            self._history_color[i] = 0
 
         return True
 

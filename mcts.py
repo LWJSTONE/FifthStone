@@ -1,6 +1,15 @@
 """
-深度优化 MCTS (V8 — PUCT符号修复版)
+深度优化 MCTS (V9 — 终端价值符号修复版)
 ======================================
+V9 修复 (关键):
+  1. 修复终端价值符号 — _backpropagate 期望 value 从叶节点自身视角,
+     而非落子方视角。之前 value=1 if winner==last_player 是从落子方视角,
+     改为 value=1 if winner==current_player (叶节点视角)
+  2. 修复 RAVE rave_value 符号 — child.rave_value += -value
+     (value 是父节点视角, 子节点自身视角需要取反)
+  3. 修复子树复用 — 不重置 root.visit_count (保留上次搜索统计是正确行为)
+  4. 修复 _select_child_from_list 截断代码 — best_child None 检查
+
 V8 修复 (关键):
   1. 修复 PUCT q_value 符号错误 — total_value 从节点自身视角存储,
      PUCT 从父节点视角选择需取反 (-q_value)
@@ -280,6 +289,10 @@ class MCTS:
             # 直接使用当前的 self.root 作为新搜索的根
             if self.root.is_expanded and self.root.children:
                 root = self.root
+                # V9: 不重置 root 的 visit_count/total_value!
+                # 子树复用时保留上次搜索的统计是正确行为:
+                # 这些统计反映了该节点被搜索的历史, 有助于新搜索
+                # 只需重新施加 Dirichlet 噪声 (基于 original_prior)
                 # V3 修复: 基于 original_prior 施加 Dirichlet 噪声, 防止累积
                 if self.add_noise and root.children:
                     noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(root.children))
@@ -363,13 +376,14 @@ class MCTS:
 
                 # 评估
                 if board.game_over:
-                    # 正确的终端价值
+                    # V9 修复: 终端价值从叶节点视角计算
+                    # 叶节点代表落子后的状态, 其轮次 = board.current_player
+                    # total_value 应从节点自身视角存储
                     if board.winner == 0:
                         value = 0.0
                     else:
-                        # place_stone后 current_player 已切换到对手
-                        last_player = 3 - board.current_player
-                        value = 1.0 if board.winner == last_player else -1.0
+                        # 从叶节点(current_player)视角: 自己赢=+1, 对手赢=-1
+                        value = 1.0 if board.winner == board.current_player else -1.0
                     self._backpropagate(path, value)
                 else:
                     if not node.is_expanded:
@@ -396,6 +410,7 @@ class MCTS:
                                 self._backpropagate(path, FPU_VALUE if USE_FPU else 0.0)
                     else:
                         # 已扩展无子节点 → 终局/死胡同, 用缓存值回传
+                        # V9: q_value 已从节点自身视角存储, 直接回传即可
                         if not node.children:
                             value = node.q_value if node.visit_count > 0 else node.cached_value
                             self._backpropagate(path, value)
@@ -432,8 +447,8 @@ class MCTS:
                     if sim_board.winner == 0:
                         value = 0.0
                     else:
-                        last_player = 3 - sim_board.current_player
-                        value = 1.0 if sim_board.winner == last_player else -1.0
+                        # V9 修复: 从叶节点(current_player)视角
+                        value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
                     self._backpropagate(path, value)
                 else:
                     if not node.is_expanded:
@@ -457,6 +472,7 @@ class MCTS:
                             else:
                                 self._backpropagate(path, FPU_VALUE if USE_FPU else 0.0)
                     else:
+                        # V9: 同 undo 路径, q_value 直接回传
                         if not node.children:
                             value = node.q_value if node.visit_count > 0 else node.cached_value
                             self._backpropagate(path, value)
@@ -558,9 +574,8 @@ class MCTS:
                                 if board.winner == 0:
                                     value = 0.0
                                 else:
-                                    # V4 修复: place_stone后 current_player 已切换
-                                    last_player = 3 - board.current_player
-                                    value = 1.0 if board.winner == last_player else -1.0
+                                    # V9 修复: 从叶节点视角
+                                    value = 1.0 if board.winner == board.current_player else -1.0
                                 self._backpropagate(path, value)
                             else:
                                 if not node.is_expanded:
@@ -592,9 +607,8 @@ class MCTS:
                                 if sim_board.winner == 0:
                                     value = 0.0
                                 else:
-                                    # V4 修复
-                                    last_player = 3 - sim_board.current_player
-                                    value = 1.0 if sim_board.winner == last_player else -1.0
+                                    # V9 修复
+                                    value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
                                 self._backpropagate(path, value)
                             else:
                                 if not node.is_expanded:
@@ -659,9 +673,8 @@ class MCTS:
                         if board.winner == 0:
                             value = 0.0
                         else:
-                            # V4 修复
-                            last_player = 3 - board.current_player
-                            value = 1.0 if board.winner == last_player else -1.0
+                            # V9 修复
+                            value = 1.0 if board.winner == board.current_player else -1.0
                         self._backpropagate(path, value)
                     else:
                         if not node.is_expanded:
@@ -693,9 +706,8 @@ class MCTS:
                         if sim_board.winner == 0:
                             value = 0.0
                         else:
-                            # V4 修复
-                            last_player = 3 - sim_board.current_player
-                            value = 1.0 if sim_board.winner == last_player else -1.0
+                            # V9 修复
+                            value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
                         self._backpropagate(path, value)
                     else:
                         if not node.is_expanded:
@@ -915,7 +927,8 @@ class MCTS:
                 best_action = action
                 best_child = child
 
-        best_child.virtual_loss += 1
+        if best_child is not None:
+            best_child.virtual_loss += 1
         return best_action, best_child
 
     def _expand_node(self, node, board):
@@ -1001,9 +1014,10 @@ class MCTS:
                 node.parent.sqrt_N = math.sqrt(node.parent.visit_count + 1)
 
             if USE_RAVE:
-                # V7: RAVE value 从当前节点视角计算
-                # 当前 value 是从当前节点父节点视角的
-                # 子节点的 rave_value 应从当前节点视角计算 = -value
+                # V9 修复: RAVE value 符号
+                # 当前 value 是从 node 父节点视角的
+                # 子节点的 rave_value 应从子节点自身视角存储(与 total_value 一致)
+                # 子节点自身视角 = -父节点视角 = -value
                 for action in subtree_actions:
                     if action in node.children:
                         child = node.children[action]
