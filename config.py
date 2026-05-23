@@ -41,7 +41,7 @@ VALUE_HIDDEN = 64
 
 # 推理优化
 USE_TORCHSCRIPT = True          # TorchScript 编译 (仅推理时)
-USE_INT8_QUANT = True           # INT8 动态量化 (含 Conv2d)
+USE_INT8_QUANT = True           # INT8 动态量化 (仅Linear, CPU上quantize_dynamic不支持Conv2d)
 USE_BN_FUSE = True              # BN 融合 (推理时)
 USE_NHWC = True                 # 通道最后内存格式
 USE_ONNX_RUNTIME = False        # ONNX Runtime 推理 (需安装 onnxruntime)

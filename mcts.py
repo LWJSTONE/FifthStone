@@ -402,7 +402,20 @@ class MCTS:
                 value = None
 
                 while node.is_expanded and node.children:
-                    action, node = self._select_child(node)
+                    # V7 修复: Board.copy() 路径也应用 Progressive Widening
+                    if USE_PROGRESSIVE_WIDENING and node.visit_count > 0:
+                        max_children = max(1, int(PW_C * (node.visit_count ** 0.5)))
+                        if len(node.children) > max_children:
+                            sorted_children = sorted(
+                                node.children.items(),
+                                key=lambda x: x[1].visit_count,
+                                reverse=True
+                            )[:max_children]
+                            action, node = self._select_child_from_list(node, sorted_children)
+                        else:
+                            action, node = self._select_child(node)
+                    else:
+                        action, node = self._select_child(node)
                     sim_board.place_stone(*sim_board.index_to_move(action))
                     path.append(node)
 
@@ -968,7 +981,7 @@ class MCTS:
         return value
 
     def _backpropagate(self, path, value):
-        """回传价值 + RAVE (V6: 修复RAVE价值符号)"""
+        """回传价值 + RAVE (V7: 清理冗余条件)"""
         # RAVE 只应使用当前节点子树中的动作, 而非整条路径
         subtree_actions = set() if USE_RAVE else None
 
@@ -980,16 +993,13 @@ class MCTS:
                 node.parent.sqrt_N = math.sqrt(node.parent.visit_count + 1)
 
             if USE_RAVE:
-                # V6 修复: RAVE value 应从父节点视角计算
-                # 当前 value 是从当前节点的父节点视角的 (即该节点的q_value的视角)
-                # 但子节点的 rave_value 应该从子节点的父节点(=当前节点)视角计算
-                # 所以需要使用 -value (因为 value 在上一层被取反了)
+                # V7: RAVE value 从当前节点视角计算
+                # 当前 value 是从当前节点父节点视角的
+                # 子节点的 rave_value 应从当前节点视角计算 = -value
                 for action in subtree_actions:
-                    if action in node.children and action != node.action:
+                    if action in node.children:
                         child = node.children[action]
                         child.rave_count += 1
-                        # V6 修复: 使用 -value, 因为 value 此时的视角是当前节点的父节点,
-                        # 而子节点的 rave_value 应该从当前节点(子节点的父节点)的视角
                         child.rave_value += -value
                 # 当前节点的动作属于其父节点的子树
                 if node.action is not None:

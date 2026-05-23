@@ -424,9 +424,15 @@ class Trainer:
         }
 
     def _champion_eval(self):
-        """新旧模型对弈评估"""
+        """新旧模型对弈评估 — V7: 使用EMA模型评估"""
         if self.champion_model is None:
             return 0.5
+
+        # V7: 评估时使用 EMA 模型 (更稳定)
+        eval_model = self.model
+        if USE_EMA and self.ema_model is not None:
+            self.ema_model.apply(self.model)
+            eval_model = self.model  # EMA 权重已应用到 self.model
 
         wins = draws = losses = 0
         eval_sims = max(50, NUM_SIMULATIONS // 4)
@@ -436,7 +442,7 @@ class Trainer:
             new_is_black = (game_idx % 2 == 0)
             new_color = BLACK if new_is_black else WHITE
 
-            mcts_new = MCTS(self.model, num_simulations=eval_sims, add_noise=False, temperature=0.0)
+            mcts_new = MCTS(eval_model, num_simulations=eval_sims, add_noise=False, temperature=0.0)
             mcts_champ = MCTS(self.champion_model, num_simulations=eval_sims, add_noise=False, temperature=0.0)
 
             while not board.game_over and board.move_count < MAX_MOVES:
@@ -458,30 +464,35 @@ class Trainer:
             else:
                 losses += 1
 
+        # V7: 评估后恢复原始权重
+        if USE_EMA and self.ema_model is not None:
+            self.ema_model.restore(self.model)
+
         total = wins + draws + losses
         return (wins + 0.5 * draws) / max(1, total)
 
     def _simple_eval(self):
-        """V5 修复: 与随机基线对弈评估 — 自博弈胜率恒≈50%无意义"""
+        """V7 修复: 与随机基线对弈评估 — 使用EMA模型"""
+        # V7: 评估时使用 EMA 模型
+        if USE_EMA and self.ema_model is not None:
+            self.ema_model.apply(self.model)
+
         self.model.eval()
         wins = draws = losses = 0
         n_games = min(EVAL_GAMES, 6)
 
         for game_idx in range(n_games):
             board = Board()
-            # 模型执黑/执白交替
             model_color = BLACK if game_idx % 2 == 0 else WHITE
             mcts = MCTS(self.model, num_simulations=max(50, NUM_SIMULATIONS // 4),
                         add_noise=False, temperature=0.0)
 
             while not board.game_over and board.move_count < MAX_MOVES:
                 if board.current_player == model_color:
-                    # 模型下棋
                     probs, _ = mcts.search(board)
                     action = np.argmax(probs)
                     mcts.advance(action)
                 else:
-                    # 随机基线: 从合法着法中随机选 (优先选邻居内的着法)
                     legal = board.get_legal_move_indices()
                     if legal:
                         action = legal[np.random.randint(len(legal))]
@@ -496,6 +507,10 @@ class Trainer:
                 wins += 1
             else:
                 losses += 1
+
+        # V7: 评估后恢复原始权重
+        if USE_EMA and self.ema_model is not None:
+            self.ema_model.restore(self.model)
 
         total = wins + draws + losses
         wr = (wins + 0.5 * draws) / max(1, total)

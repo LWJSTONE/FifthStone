@@ -359,15 +359,15 @@ def _optimize_for_inference(model):
     # V4 修复: 按优先级尝试, 第一个成功的即返回
     # INT8动态量化对Conv2d的CPU支持有限, 先尝试, 失败则回退
 
-    # 2. INT8 动态量化 (包含 Conv2d)
+    # 2. INT8 动态量化 (仅 Linear, CPU 上 quantize_dynamic 不支持 Conv2d)
     if USE_INT8_QUANT:
         try:
             quantized = torch.quantization.quantize_dynamic(
                 model,
-                {nn.Linear, nn.Conv2d},  # V2: 同时量化 Conv2d
+                {nn.Linear},  # V7 修复: CPU 上 quantize_dynamic 仅支持 Linear
                 dtype=torch.qint8
             )
-            print("[Network] INT8 动态量化成功 (Linear + Conv2d)")
+            print("[Network] INT8 动态量化成功 (Linear)")
             return quantized
         except Exception as e:
             print(f"[Network] INT8 量化跳过 ({e})")
