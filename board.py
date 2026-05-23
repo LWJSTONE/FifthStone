@@ -450,34 +450,10 @@ class Board:
 
     def place_stone_fast(self, r, c):
         """
-        V2: 快速落子 — 用于MCTS模拟 (与 place_stone 等效, 保留向后兼容)
+        快速落子 — place_stone 的别名 (pattern_count 移除后两者完全等效)
+        保留此方法以兼容 MCTS 中的调用
         """
-        if self.game_over or not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
-            return False
-        if self.board[r, c] != EMPTY:
-            return False
-
-        color = self.current_player
-        self.board[r, c] = color
-        idx = r * BOARD_SIZE + c
-        self.zobrist_hash ^= ZOBRIST_TABLE[idx, color - 1]
-        self.zobrist_hash ^= ZOBRIST_TURN
-
-        self.move_history.append((r, c, color))
-        self._history_r[self.move_count] = r
-        self._history_c[self.move_count] = c
-        self._history_color[self.move_count] = color
-        self.move_count += 1
-
-        if check_win_at(self.board, r, c, color):
-            self.game_over = True
-            self.winner = color
-        elif self.move_count >= BOARD_SQUARES:
-            self.game_over = True
-            self.winner = 0
-        else:
-            self.current_player = 3 - color
-        return True
+        return self.place_stone(r, c)
 
     def undo_stone(self):
         """撤销最后一步 — 不维护增量棋型计数 (pattern_count 已移除)"""

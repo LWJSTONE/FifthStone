@@ -315,16 +315,19 @@ class MCTS:
         return action_probs, root_value
 
     def _standard_search(self, board, root, num_sims):
-        """标准 AlphaZero MCTS (V3: 修复批量推理扩展 + root_value)"""
+        """标准 AlphaZero MCTS (V5: 真正的批量推理 + 正确RAVE)"""
         batch_features = []
         batch_masks = []
         batch_nodes = []
         batch_paths = []
-        batch_boards = []  # V3: 保存 board 快照用于模式注入
+        batch_boards = []  # 保存 board 快照用于模式注入
+
+        # V5 修复: 使用集合跟踪待推理节点, 避免同一节点重复加入批量
+        pending_node_ids = set()
 
         for sim in range(num_sims):
             if USE_UNDO_MCTS:
-                # V2: Undo-based — 不需要 copy()
+                # Undo-based — 不需要 copy()
                 board.save_state()
                 node = root
                 path = [node]
@@ -336,7 +339,6 @@ class MCTS:
                     if USE_PROGRESSIVE_WIDENING and node.visit_count > 0:
                         max_children = max(1, int(PW_C * (node.visit_count ** 0.5)))
                         if len(node.children) > max_children:
-                            # 只考虑访问量最高的 top-k 子节点
                             sorted_children = sorted(
                                 node.children.items(),
                                 key=lambda x: x[1].visit_count,
@@ -347,52 +349,49 @@ class MCTS:
                             action, node = self._select_child(node)
                     else:
                         action, node = self._select_child(node)
-                    # V3: 用place_stone_fast替代place_stone, 省去无用的棋型计算
-                    board.place_stone_fast(*board.index_to_move(action))
+                    board.place_stone(*board.index_to_move(action))
                     path.append(node)
 
                 # 评估
                 if board.game_over:
-                    # V2 修复: 正确的终端价值
+                    # 正确的终端价值
                     if board.winner == 0:
                         value = 0.0
                     else:
-                        # V4 修复: place_stone后 current_player 已切换到对手
-                        # board.winner 是刚落子的玩家(即 3 - board.current_player)
-                        # value 应从当前玩家(即刚落子的对手)视角返回
+                        # place_stone后 current_player 已切换到对手
                         last_player = 3 - board.current_player
                         value = 1.0 if board.winner == last_player else -1.0
                     self._backpropagate(path, value)
                 else:
                     if not node.is_expanded:
-                        # V2: expand 返回 value, 不需要二次推理
-                        value = self._expand_node(node, board)
-                        if value is not None:
-                            self._backpropagate(path, value)
+                        # V5 修复: 收集叶子节点用于批量推理, 不做即时推理
+                        legal_indices = board.get_legal_move_indices()
+                        if not legal_indices:
+                            # 无合法着法 (棋盘已满) — 平局
+                            self._backpropagate(path, 0.0)
                         else:
-                            # 需要批量推理
-                            feature = board.get_feature_planes()
-                            legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                            for idx in board.get_legal_move_indices():
-                                legal_mask[idx] = 1.0
-                            batch_features.append(feature)
-                            batch_masks.append(legal_mask)
-                            batch_nodes.append(node)
-                            batch_paths.append(path)
-                            batch_boards.append((board.board.copy(), board.current_player))
+                            node_id = id(node)
+                            if node_id not in pending_node_ids:
+                                pending_node_ids.add(node_id)
+                                feature = board.get_feature_planes()
+                                legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                for idx in legal_indices:
+                                    legal_mask[idx] = 1.0
+                                batch_features.append(feature)
+                                batch_masks.append(legal_mask)
+                                batch_nodes.append(node)
+                                batch_paths.append(path)
+                                batch_boards.append((board.board.copy(), board.current_player))
+                            else:
+                                # 节点已在批量中 — 用 FPU 值先回传, 后续批量推理会更新
+                                self._backpropagate(path, FPU_VALUE if USE_FPU else 0.0)
                     else:
-                        # V4 修复: 已扩展有子节点 → 正常选择(不应到达此处)
-                        # 已扩展无子节点 → 终局/死胡同, 用 q_value 回传
-                        if node.children:
-                            # 理论上不应到达这里: while循环会在children非空时继续
-                            # 安全起见跳过此模拟
-                            pass
-                        else:
-                            # 无子节点的已扩展节点: 终局或无合法着法
+                        # 已扩展无子节点 → 终局/死胡同, 用缓存值回传
+                        if not node.children:
                             value = node.q_value if node.visit_count > 0 else node.cached_value
                             self._backpropagate(path, value)
 
-                    # 批量推理
+                    # 批量推理 (达到批量大小或最后一次模拟时刷新)
                     if len(batch_features) >= MCTS_BATCH_SIZE or sim == num_sims - 1:
                         if batch_features:
                             self._batch_inference(batch_features, batch_masks,
@@ -402,6 +401,7 @@ class MCTS:
                             batch_nodes.clear()
                             batch_paths.clear()
                             batch_boards.clear()
+                            pending_node_ids.clear()
 
                 # Undo
                 board.restore_state()
@@ -415,34 +415,38 @@ class MCTS:
 
                 while node.is_expanded and node.children:
                     action, node = self._select_child(node)
-                    sim_board.place_stone_fast(*sim_board.index_to_move(action))
+                    sim_board.place_stone(*sim_board.index_to_move(action))
                     path.append(node)
 
                 if sim_board.game_over:
                     if sim_board.winner == 0:
                         value = 0.0
                     else:
-                        # V4 修复: place_stone后 current_player 已切换
                         last_player = 3 - sim_board.current_player
                         value = 1.0 if sim_board.winner == last_player else -1.0
                     self._backpropagate(path, value)
                 else:
                     if not node.is_expanded:
-                        value = self._expand_node(node, sim_board)
-                        if value is not None:
-                            self._backpropagate(path, value)
+                        # V5 修复: 收集叶子节点用于批量推理
+                        legal_indices = sim_board.get_legal_move_indices()
+                        if not legal_indices:
+                            self._backpropagate(path, 0.0)
                         else:
-                            feature = sim_board.get_feature_planes()
-                            legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                            for idx in sim_board.get_legal_move_indices():
-                                legal_mask[idx] = 1.0
-                            batch_features.append(feature)
-                            batch_masks.append(legal_mask)
-                            batch_nodes.append(node)
-                            batch_paths.append(path)
-                            batch_boards.append((sim_board.board.copy(), sim_board.current_player))
+                            node_id = id(node)
+                            if node_id not in pending_node_ids:
+                                pending_node_ids.add(node_id)
+                                feature = sim_board.get_feature_planes()
+                                legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                for idx in legal_indices:
+                                    legal_mask[idx] = 1.0
+                                batch_features.append(feature)
+                                batch_masks.append(legal_mask)
+                                batch_nodes.append(node)
+                                batch_paths.append(path)
+                                batch_boards.append((sim_board.board.copy(), sim_board.current_player))
+                            else:
+                                self._backpropagate(path, FPU_VALUE if USE_FPU else 0.0)
                     else:
-                        # V4 修复: 已扩展无子节点
                         if not node.children:
                             value = node.q_value if node.visit_count > 0 else node.cached_value
                             self._backpropagate(path, value)
@@ -456,6 +460,7 @@ class MCTS:
                             batch_nodes.clear()
                             batch_paths.clear()
                             batch_boards.clear()
+                            pending_node_ids.clear()
 
             # 提前终止
             if sim > num_sims // 2 and root.visit_count > 10 and root.children:
@@ -767,18 +772,19 @@ class MCTS:
         return action_probs, root_value
 
     def _batch_inference(self, features, masks, nodes, paths, boards=None):
-        """V3 修复: 批量推理后必须扩展节点, 否则节点永远不会被扩展"""
+        """V5 修复: 批量推理 + 正确扩展 + 防止双重回传"""
         if not features:
             return
 
         batch_size = len(features)
         if batch_size == 1:
-            # 单样本直接推理 — V3: 也要扩展节点
+            # 单样本直接推理
             policy, value = self.model.predict(features[0], masks[0])
             node = nodes[0]
             if not node.is_expanded and boards is not None and boards[0] is not None:
                 board_state, current_player = boards[0]
                 self._expand_node_with_policy(node, policy, masks[0], board_state, current_player)
+                node.cached_value = float(value)
             self._backpropagate(paths[0], float(value))
             return
 
@@ -790,7 +796,14 @@ class MCTS:
             if not node.is_expanded and boards is not None and boards[i] is not None:
                 board_state, current_player = boards[i]
                 self._expand_node_with_policy(node, policies[i], masks[i], board_state, current_player)
-            self._backpropagate(paths[i], float(values[i]))
+                node.cached_value = float(values[i])
+                self._backpropagate(paths[i], float(values[i]))
+            elif node.is_expanded:
+                # V5 修复: 节点已被其他批量条目扩展 — 用缓存值回传, 防止双重计数
+                self._backpropagate(paths[i], node.cached_value)
+            else:
+                # boards 为 None — 无法扩展, 直接回传推理值
+                self._backpropagate(paths[i], float(values[i]))
 
     def _expand_node_with_policy(self, node, policy, legal_mask, board_state, current_player):
         """使用已有 policy 扩展节点 (避免重复推理) — V3: 支持模式注入"""
@@ -947,12 +960,10 @@ class MCTS:
         return value
 
     def _backpropagate(self, path, value):
-        """回传价值 + RAVE"""
-        path_actions = set()
-        if USE_RAVE:
-            for node in path:
-                if node.action is not None:
-                    path_actions.add(node.action)
+        """回传价值 + RAVE (V5: 修复RAVE只使用子树动作)"""
+        # V5 修复: RAVE 只应使用当前节点子树中的动作, 而非整条路径
+        # 从叶子向根遍历时, 逐步添加已处理节点的动作到子树集合
+        subtree_actions = set() if USE_RAVE else None
 
         for node in reversed(path):
             node.visit_count += 1
@@ -962,11 +973,15 @@ class MCTS:
                 node.parent.sqrt_N = math.sqrt(node.parent.visit_count + 1)
 
             if USE_RAVE:
-                for action in path_actions:
+                # 只用子树内的动作更新 RAVE
+                for action in subtree_actions:
                     if action in node.children and action != node.action:
                         child = node.children[action]
                         child.rave_count += 1
                         child.rave_value += value
+                # 当前节点的动作属于其父节点的子树
+                if node.action is not None:
+                    subtree_actions.add(node.action)
 
             value = -value
 

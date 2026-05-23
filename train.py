@@ -435,37 +435,50 @@ class Trainer:
         return (wins + 0.5 * draws) / max(1, total)
 
     def _simple_eval(self):
-        """简单评估 — V2: 修复为双视角"""
+        """V5 修复: 与随机基线对弈评估 — 自博弈胜率恒≈50%无意义"""
         self.model.eval()
-        black_wins = white_wins = draws = 0
-        n_games = min(EVAL_GAMES, 4)
+        wins = draws = losses = 0
+        n_games = min(EVAL_GAMES, 6)
 
-        for _ in range(n_games):
+        for game_idx in range(n_games):
             board = Board()
-            mcts = MCTS(self.model, num_simulations=NUM_SIMULATIONS // 2, add_noise=False, temperature=0.0)
-            while not board.game_over and board.move_count < MAX_MOVES:
-                probs, _ = mcts.search(board)
-                action = np.argmax(probs)
-                board.place_stone(*board.index_to_move(action))
-                mcts.advance(action)
-            if board.winner == BLACK:
-                black_wins += 1
-            elif board.winner == WHITE:
-                white_wins += 1
-            else:
-                draws += 1
+            # 模型执黑/执白交替
+            model_color = BLACK if game_idx % 2 == 0 else WHITE
+            mcts = MCTS(self.model, num_simulations=max(50, NUM_SIMULATIONS // 4),
+                        add_noise=False, temperature=0.0)
 
-        total = black_wins + white_wins + draws
-        # V4 修复: 正确的综合胜率计算
-        # 黑白双方都由同一个模型控制, 胜率 = (总胜 + 0.5*平) / 总局数
-        wr = (black_wins + white_wins + 0.5 * draws) / max(1, total)
-        # ELO: 基于500分基准的估算
+            while not board.game_over and board.move_count < MAX_MOVES:
+                if board.current_player == model_color:
+                    # 模型下棋
+                    probs, _ = mcts.search(board)
+                    action = np.argmax(probs)
+                    mcts.advance(action)
+                else:
+                    # 随机基线: 从合法着法中随机选 (优先选邻居内的着法)
+                    legal = board.get_legal_move_indices()
+                    if legal:
+                        action = legal[np.random.randint(len(legal))]
+                    else:
+                        break
+
+                board.place_stone(*board.index_to_move(action))
+
+            if board.winner == 0:
+                draws += 1
+            elif board.winner == model_color:
+                wins += 1
+            else:
+                losses += 1
+
+        total = wins + draws + losses
+        wr = (wins + 0.5 * draws) / max(1, total)
+        # ELO: 基于对随机基线胜率的估算 (随机≈0 ELO)
         if wr >= 0.99:
-            elo = 2000
+            elo = 1500
         elif wr <= 0.01:
             elo = 0
         else:
-            elo = max(0, -400 * np.log10(1.0 / wr - 1) + 1000)
+            elo = max(0, -400 * np.log10(1.0 / wr - 1) + 500)
         return elo
 
     def save_checkpoint(self, path):
