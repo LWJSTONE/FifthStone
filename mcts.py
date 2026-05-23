@@ -1,12 +1,21 @@
 """
-深度优化 MCTS (V9 — 终端价值符号修复版)
-======================================
-V9 修复 (关键):
-  1. 修复终端价值符号 — _backpropagate 期望 value 从叶节点自身视角,
-     而非落子方视角。之前 value=1 if winner==last_player 是从落子方视角,
-     改为 value=1 if winner==current_player (叶节点视角)
-  2. 修复 RAVE rave_value 符号 — child.rave_value += -value
-     (value 是父节点视角, 子节点自身视角需要取反)
+深度优化 MCTS (V12 — 终端价值符号关键修复版)
+============================================
+V12 修复 (关键):
+  1. 终端价值符号: 胜利后 board.current_player 不切换(仍为赢家),
+     但 MCTS 叶节点视角应为"下一个该走棋的玩家"= 输家。
+     之前 value = 1.0 if winner == current_player (始终+1.0, 赢家视角),
+     修复为 value = -1.0 (输家视角, 与非终端节点一致)。
+     此Bug导致MCTS回避赢棋走法、偏好输棋走法, 训练完全错误!
+  2. undo_stone: 清除已撤销步骤的历史数组数据 (board.py)
+
+V11 修复:
+  1. Gumbel搜索: _expand_node返回None(无合法着法)时正确回传0.0(平局),
+     而非错误加入批量推理
+  2. _batch_inference: boards=None且节点未扩展时, legal_mask全零(平局)
+     正确回传0.0而非网络值
+  3. _expand_node_with_policy: 添加转置表注释(无法获取Zobrist哈希)
+  4. 移除未使用的 import (INPUT_CHANNELS, HISTORY_LENGTH)
   3. 修复子树复用 — 不重置 root.visit_count (保留上次搜索统计是正确行为)
   4. 修复 _select_child_from_list 截断代码 — best_child None 检查
 
@@ -57,7 +66,7 @@ from config import (
     USE_UNDO_MCTS, USE_NODE_POOL, NODE_POOL_SIZE,
     USE_ROOT_PARALLEL, ROOT_PARALLEL_THREADS,
     USE_PROGRESSIVE_WIDENING, PW_C,
-    USE_Q_NORM, INPUT_CHANNELS, HISTORY_LENGTH
+    USE_Q_NORM
 )
 from board import Board, EMPTY, BLACK, WHITE
 from vct import (
@@ -379,14 +388,16 @@ class MCTS:
 
                 # 评估
                 if board.game_over:
-                    # V9 修复: 终端价值从叶节点视角计算
-                    # 叶节点代表落子后的状态, 其轮次 = board.current_player
-                    # total_value 应从节点自身视角存储
+                    # V12 修复: 终端价值从叶节点视角计算
+                    # place_stone 胜利后 current_player 不切换, 仍为落子方(赢家)
+                    # 叶节点的视角是 "下一个该走棋的玩家" = 3 - current_player = 输家
+                    # 从输家视角: value = -1 (输了)
                     if board.winner == 0:
                         value = 0.0
                     else:
-                        # 从叶节点(current_player)视角: 自己赢=+1, 对手赢=-1
-                        value = 1.0 if board.winner == board.current_player else -1.0
+                        # leaf_player = 3 - board.current_player (因为 current_player 未切换)
+                        # winner 永远 == current_player, 所以 leaf_player 永远 != winner
+                        value = -1.0
                     self._backpropagate(path, value)
                 else:
                     if not node.is_expanded:
@@ -450,8 +461,8 @@ class MCTS:
                     if sim_board.winner == 0:
                         value = 0.0
                     else:
-                        # V9 修复: 从叶节点(current_player)视角
-                        value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
+                        # V12 修复: 从叶节点(下一个该走棋的玩家)视角
+                        value = -1.0 if sim_board.winner != 0 else 0.0
                     self._backpropagate(path, value)
                 else:
                     if not node.is_expanded:
@@ -580,8 +591,8 @@ class MCTS:
                                 if board.winner == 0:
                                     value = 0.0
                                 else:
-                                    # V9 修复: 从叶节点视角
-                                    value = 1.0 if board.winner == board.current_player else -1.0
+                                    # V12 修复: 从叶节点视角
+                                    value = -1.0 if board.winner != 0 else 0.0
                                 self._backpropagate(path, value)
                             else:
                                 if not node.is_expanded:
@@ -589,14 +600,20 @@ class MCTS:
                                     if v is not None:
                                         self._backpropagate(path, v)
                                     else:
-                                        feature = board.get_feature_planes()
-                                        legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                                        for idx2 in board.get_legal_move_indices():
-                                            legal_mask[idx2] = 1.0
-                                        batch_features.append(feature)
-                                        batch_masks.append(legal_mask)
-                                        batch_child_nodes.append(node)
-                                        batch_paths.append(path)
+                                        # V11 修复: _expand_node返回None表示无合法着法(平局)
+                                        # 应直接回传0.0, 而非加入批量推理
+                                        legal_indices = board.get_legal_move_indices()
+                                        if not legal_indices:
+                                            self._backpropagate(path, 0.0)
+                                        else:
+                                            feature = board.get_feature_planes()
+                                            legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                            for idx2 in legal_indices:
+                                                legal_mask[idx2] = 1.0
+                                            batch_features.append(feature)
+                                            batch_masks.append(legal_mask)
+                                            batch_child_nodes.append(node)
+                                            batch_paths.append(path)
 
                             board.restore_state()
                         else:
@@ -613,8 +630,8 @@ class MCTS:
                                 if sim_board.winner == 0:
                                     value = 0.0
                                 else:
-                                    # V9 修复
-                                    value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
+                                    # V12 修复
+                                    value = -1.0 if sim_board.winner != 0 else 0.0
                                 self._backpropagate(path, value)
                             else:
                                 if not node.is_expanded:
@@ -622,14 +639,19 @@ class MCTS:
                                     if v is not None:
                                         self._backpropagate(path, v)
                                     else:
-                                        feature = sim_board.get_feature_planes()
-                                        legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                                        for idx2 in sim_board.get_legal_move_indices():
-                                            legal_mask[idx2] = 1.0
-                                        batch_features.append(feature)
-                                        batch_masks.append(legal_mask)
-                                        batch_child_nodes.append(node)
-                                        batch_paths.append(path)
+                                        # V11 修复: 同上
+                                        legal_indices = sim_board.get_legal_move_indices()
+                                        if not legal_indices:
+                                            self._backpropagate(path, 0.0)
+                                        else:
+                                            feature = sim_board.get_feature_planes()
+                                            legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                            for idx2 in legal_indices:
+                                                legal_mask[idx2] = 1.0
+                                            batch_features.append(feature)
+                                            batch_masks.append(legal_mask)
+                                            batch_child_nodes.append(node)
+                                            batch_paths.append(path)
 
                 # 批量推理 (V3: 传入 None 作为 boards, Gumbel模式下节点已通过 _expand_node 扩展)
                 if batch_features:
@@ -679,8 +701,8 @@ class MCTS:
                         if board.winner == 0:
                             value = 0.0
                         else:
-                            # V9 修复
-                            value = 1.0 if board.winner == board.current_player else -1.0
+                            # V12 修复
+                            value = -1.0 if board.winner != 0 else 0.0
                         self._backpropagate(path, value)
                     else:
                         if not node.is_expanded:
@@ -688,14 +710,19 @@ class MCTS:
                             if v is not None:
                                 self._backpropagate(path, v)
                             else:
-                                feature = board.get_feature_planes()
-                                legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                                for idx2 in board.get_legal_move_indices():
-                                    legal_mask[idx2] = 1.0
-                                batch_features.append(feature)
-                                batch_masks.append(legal_mask)
-                                batch_child_nodes.append(node)
-                                batch_paths.append(path)
+                                # V11 修复: 同上
+                                legal_indices = board.get_legal_move_indices()
+                                if not legal_indices:
+                                    self._backpropagate(path, 0.0)
+                                else:
+                                    feature = board.get_feature_planes()
+                                    legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                    for idx2 in legal_indices:
+                                        legal_mask[idx2] = 1.0
+                                    batch_features.append(feature)
+                                    batch_masks.append(legal_mask)
+                                    batch_child_nodes.append(node)
+                                    batch_paths.append(path)
 
                     board.restore_state()
                 else:
@@ -712,8 +739,8 @@ class MCTS:
                         if sim_board.winner == 0:
                             value = 0.0
                         else:
-                            # V9 修复
-                            value = 1.0 if sim_board.winner == sim_board.current_player else -1.0
+                            # V12 修复
+                            value = -1.0 if sim_board.winner != 0 else 0.0
                         self._backpropagate(path, value)
                     else:
                         if not node.is_expanded:
@@ -721,14 +748,19 @@ class MCTS:
                             if v is not None:
                                 self._backpropagate(path, v)
                             else:
-                                feature = sim_board.get_feature_planes()
-                                legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
-                                for idx2 in sim_board.get_legal_move_indices():
-                                    legal_mask[idx2] = 1.0
-                                batch_features.append(feature)
-                                batch_masks.append(legal_mask)
-                                batch_child_nodes.append(node)
-                                batch_paths.append(path)
+                                # V11 修复: 同上
+                                legal_indices = sim_board.get_legal_move_indices()
+                                if not legal_indices:
+                                    self._backpropagate(path, 0.0)
+                                else:
+                                    feature = sim_board.get_feature_planes()
+                                    legal_mask = np.zeros(BOARD_SQUARES, dtype=np.float32)
+                                    for idx2 in legal_indices:
+                                        legal_mask[idx2] = 1.0
+                                    batch_features.append(feature)
+                                    batch_masks.append(legal_mask)
+                                    batch_child_nodes.append(node)
+                                    batch_paths.append(path)
 
         if batch_features:
             self._batch_inference(batch_features, batch_masks,
@@ -825,8 +857,12 @@ class MCTS:
                 # V6: 节点已被其他路径扩展 — 用缓存值回传, 防止双重计数
                 self._backpropagate(paths[0], node.cached_value)
             else:
-                # boards 为 None — 无法扩展, 直接回传推理值
-                self._backpropagate(paths[0], float(value))
+                # boards 为 None — 无法扩展节点
+                # V11 修复: 如果legal_mask全零(无合法着法=平局), 回传0.0而非网络值
+                if masks[0].sum() < 0.5:
+                    self._backpropagate(paths[0], 0.0)
+                else:
+                    self._backpropagate(paths[0], float(value))
             return
 
         # 批量推理
@@ -843,8 +879,12 @@ class MCTS:
                 # V5 修复: 节点已被其他批量条目扩展 — 用缓存值回传, 防止双重计数
                 self._backpropagate(paths[i], node.cached_value)
             else:
-                # boards 为 None — 无法扩展, 直接回传推理值
-                self._backpropagate(paths[i], float(values[i]))
+                # boards 为 None — 无法扩展节点
+                # V11 修复: 如果legal_mask全零(无合法着法=平局), 回传0.0
+                if masks[i].sum() < 0.5:
+                    self._backpropagate(paths[i], 0.0)
+                else:
+                    self._backpropagate(paths[i], float(values[i]))
 
     def _expand_node_with_policy(self, node, policy, legal_mask, board_state, current_player):
         """使用已有 policy 扩展节点 (避免重复推理) — V6: 保存网络原始prior"""
@@ -878,6 +918,10 @@ class MCTS:
 
         node.is_expanded = True
         node.sqrt_N = 0.0
+
+        # V11 注: 转置表存储需要Zobrist哈希, 但此函数没有Board对象
+        # 无法计算正确的哈希, 因此跳过转置表存储
+        # 转置表默认禁用(USE_TRANSPOSITION=False), 影响极小
 
     def _select_child(self, node):
         """PUCT 选择 (含 Q-Normalization)"""

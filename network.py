@@ -1,6 +1,12 @@
 """
-轻量化五子棋神经网络 (V8 — 推理优化修复版)
-============================================
+轻量化五子棋神经网络 (V11 — InferenceWrapper修复版)
+====================================================
+V11 修复:
+  1. 添加 InferenceWrapper — 为 TorchScript 等优化模型提供 predict/predictBatch 接口
+  2. _optimize_for_inference 中 TorchScript 返回 InferenceWrapper 而非裸 traced model
+  3. INT8 量化模型保留原始方法, 无需 wrapper
+  4. 移除死代码 compute_pattern_feature_channels (vct.py)
+
 V8 修复:
   1. 调换 TorchScript 和 INT8 优先级 — TorchScript 优化整个计算图含 Conv2d,
      对 Conv 密集型网络比 INT8 (仅量化 Linear) 更有效
@@ -355,6 +361,10 @@ def _optimize_for_inference(model):
     V8 修复: 调换 TorchScript 和 INT8 优先级。
     本网络 Conv2d 是计算瓶颈 (6个ResBlock, 深度可分离卷积),
     TorchScript 能优化整个计算图含 Conv2d, 比 INT8 (仅量化Linear) 更有效。
+
+    V11 修复: TorchScript/INT8/torch.compile 返回的模型没有 predict/predictBatch 方法,
+    不能直接用于 MCTS。添加 InferenceWrapper 适配器, 将 forward() 结果包装为
+    predict/predictBatch 接口。
     """
     model.eval()
 
@@ -377,7 +387,7 @@ def _optimize_for_inference(model):
                 dummy_input = dummy_input.to(memory_format=torch.channels_last)
             traced = torch.jit.trace(model, dummy_input)
             print("[Network] TorchScript trace 编译成功")
-            return traced
+            return InferenceWrapper(traced)
         except Exception as e:
             print(f"[Network] TorchScript 跳过 ({type(e).__name__})")
 
@@ -390,6 +400,7 @@ def _optimize_for_inference(model):
                 dtype=torch.qint8
             )
             print("[Network] INT8 动态量化成功 (Linear)")
+            # INT8量化保留原始类的方法, predict/predictBatch 仍可用
             return quantized
         except Exception as e:
             print(f"[Network] INT8 量化跳过 ({e})")
@@ -404,6 +415,63 @@ def _optimize_for_inference(model):
             print(f"[Network] torch.compile 跳过 ({type(e).__name__})")
 
     return model
+
+
+class InferenceWrapper:
+    """V11: 为 TorchScript 等优化模型提供 predict/predictBatch 接口适配"""
+    def __init__(self, optimized_model):
+        self._model = optimized_model
+        # 代理常用属性
+        self.state_dict = optimized_model.state_dict
+        self.load_state_dict = optimized_model.load_state_dict
+
+    def __call__(self, *args, **kwargs):
+        return self._model(*args, **kwargs)
+
+    def eval(self):
+        if hasattr(self._model, 'eval'):
+            self._model.eval()
+        return self
+
+    def train(self, mode=True):
+        if hasattr(self._model, 'train'):
+            self._model.train(mode)
+        return self
+
+    def predict(self, feature_planes, legal_mask=None):
+        """单样本推理 — 适配 MCTS 调用"""
+        with torch.no_grad():
+            x = torch.from_numpy(feature_planes).float().unsqueeze(0)
+            if USE_NHWC:
+                x = x.to(memory_format=torch.channels_last)
+            policy_logits, value = self._model(x)
+            if legal_mask is not None:
+                mask = torch.from_numpy(legal_mask).float()
+                policy_logits = policy_logits.squeeze(0) + (1 - mask) * (-1e9)
+            else:
+                policy_logits = policy_logits.squeeze(0)
+            policy = F.softmax(policy_logits, dim=0).numpy()
+            value = value.item()
+        return policy, value
+
+    def predictBatch(self, feature_list, legal_masks=None):
+        """批量推理 — 适配 MCTS 调用"""
+        with torch.no_grad():
+            x = np.stack(feature_list)
+            x = torch.from_numpy(x).float()
+            if USE_NHWC:
+                x = x.to(memory_format=torch.channels_last)
+            policy_logits, values = self._model(x)
+            policy_logits_np = policy_logits.numpy()
+            values_np = values.numpy()
+
+            if legal_masks is not None:
+                masks = np.stack(legal_masks).astype(np.float32)
+                policy_logits_np = policy_logits_np + (1 - masks) * (-1e9)
+
+            exp_l = np.exp(policy_logits_np - np.max(policy_logits_np, axis=1, keepdims=True))
+            policies = exp_l / np.sum(exp_l, axis=1, keepdims=True)
+        return policies, values_np
 
 
 def create_inference_model(model):

@@ -355,6 +355,7 @@ def actor_worker(worker_id, model_state_dict, num_games, result_queue,
     from network import create_model
     model = create_model(device='cpu')
     model.load_state_dict(model_state_dict)
+    model.eval()  # V11 修复: 推理模式, 防止BatchNorm在训练模式下运行
 
     games_played = 0
     while games_played < num_games:

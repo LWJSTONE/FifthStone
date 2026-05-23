@@ -1,6 +1,10 @@
 """
-五子棋棋盘引擎 (V2 — 全面修复+优化版)
-======================================
+五子棋棋盘引擎 (V12 — undo历史清理修复版)
+==========================================
+V12 修复:
+  1. undo_stone: 清除已撤销步骤的 _history_r/_history_c/_history_color 数据,
+     防止 get_feature_planes 读取陈旧数据 (USE_UNDO_MCTS 路径)
+
 V2 修复+优化:
   1. ~~增量棋型计数~~ — 已移除: pattern_count 从未被读取 (MCTS 使用 vct.py 的 compute_pattern_prior_bonus 从头计算)
   2. Numba JIT 编译 get_feature_planes — 热路径加速
@@ -471,6 +475,11 @@ class Board:
         idx = r * BOARD_SIZE + c
         self.zobrist_hash ^= ZOBRIST_TABLE[idx, color - 1]
         self.zobrist_hash ^= ZOBRIST_TURN
+
+        # V12 修复: 清除已撤销步骤的历史数组数据, 防止 get_feature_planes 读取陈旧数据
+        self._history_r[self.move_count] = 0
+        self._history_c[self.move_count] = 0
+        self._history_color[self.move_count] = 0
 
         self.current_player = color
         self.game_over = False
