@@ -268,9 +268,9 @@ def _find_four_blocking_moves(board, four_r, four_c, attacker):
     当(four_r, four_c)形成冲四(4连+1开放端)或断四(4子1空)时,
     返回堵住这个四的位置
 
-    返回: (positions, count) — 堵四位置, 最多4个
+    返回: (positions, count) — 堵四位置, 最多8个
     """
-    positions = np.empty(4, dtype=np.int32)
+    positions = np.empty(8, dtype=np.int32)
     count = 0
     seen = np.zeros(BOARD_SQUARES, dtype=np.int32)
 
@@ -287,7 +287,7 @@ def _find_four_blocking_moves(board, four_r, four_c, attacker):
             er, ec = four_r + dr * (pos_count + 1), four_c + dc * (pos_count + 1)
             if 0 <= er < BOARD_SIZE and 0 <= ec < BOARD_SIZE and board[er, ec] == EMPTY:
                 flat = er * BOARD_SIZE + ec
-                if seen[flat] == 0 and count < 4:
+                if seen[flat] == 0 and count < 8:
                     seen[flat] = 1
                     positions[count] = flat
                     count += 1
@@ -295,7 +295,7 @@ def _find_four_blocking_moves(board, four_r, four_c, attacker):
             br, bc = four_r - dr * (neg_count + 1), four_c - dc * (neg_count + 1)
             if 0 <= br < BOARD_SIZE and 0 <= bc < BOARD_SIZE and board[br, bc] == EMPTY:
                 flat = br * BOARD_SIZE + bc
-                if seen[flat] == 0 and count < 4:
+                if seen[flat] == 0 and count < 8:
                     seen[flat] = 1
                     positions[count] = flat
                     count += 1
@@ -331,7 +331,7 @@ def _find_four_blocking_moves(board, four_r, four_c, attacker):
 
             if empty_count == 1 and stone_count == 4:
                 # 断四: 空位是必须堵的位置
-                if gap_flat >= 0 and seen[gap_flat] == 0 and count < 4:
+                if gap_flat >= 0 and seen[gap_flat] == 0 and count < 8:
                     seen[gap_flat] = 1
                     positions[count] = gap_flat
                     count += 1
@@ -339,81 +339,8 @@ def _find_four_blocking_moves(board, four_r, four_c, attacker):
     return positions, count
 
 
-@njit(cache=NUMBA_CACHE)
-def _find_forced_defense_moves(board, attacker, defender, buf):
-    """
-    找到对手的强制防御着法 (V3: 包含断四检测)
-    ==========================================
-    对手必须防守的着法包括:
-      1. 对手能直接五连的位置
-      2. 堵攻击方冲四/断四的位置
-
-    返回: (positions, count)
-    """
-    count = 0
-
-    # 1. 对手五连(对手可以忽略防守直接赢)
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if board[r, c] != EMPTY:
-                continue
-            if _check_five(board, r, c, defender):
-                if count < 30:
-                    buf[count] = r * BOARD_SIZE + c
-                    count += 1
-                # 对手有五连, 这是必须防守的
-                return buf, count
-
-    # 2. 堵攻击方的冲四/断四
-    # 先找到攻击方的所有冲四/断四位置
-    four_positions = np.empty(BOARD_SQUARES, dtype=np.int32)
-    four_count = 0
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if board[r, c] != EMPTY:
-                continue
-            is_four = False
-            for d in range(NUM_DIRS):
-                dr = DIRECTIONS[d, 0]
-                dc = DIRECTIONS[d, 1]
-                length, open_ends = _analyze_line_pattern(board, r, c, dr, dc, attacker)
-                if length >= 5:
-                    # 攻击方直接五连, 不需要防守
-                    return buf, 0
-                if length == 4 and open_ends >= 1:
-                    is_four = True
-                    break
-                # 检查断四
-                gap_length, gap_open_ends, gap_pos = _analyze_line_pattern_with_gap(
-                    board, r, c, dr, dc, attacker
-                )
-                if gap_length == 4:
-                    is_four = True
-                    break
-
-            if is_four:
-                four_positions[four_count] = r * BOARD_SIZE + c
-                four_count += 1
-
-    # 对于每个冲四/断四位置, 找到堵住它的位置
-    seen = np.zeros(BOARD_SQUARES, dtype=np.int32)
-    for i in range(four_count):
-        fr, fc = four_positions[i] // BOARD_SIZE, four_positions[i] % BOARD_SIZE
-        # 在这个位置落子形成冲四/断四
-        board[fr, fc] = attacker
-        blocking_positions, blocking_count = _find_four_blocking_moves(
-            board, fr, fc, attacker
-        )
-        board[fr, fc] = EMPTY
-
-        for j in range(blocking_count):
-            bpos = blocking_positions[j]
-            if seen[bpos] == 0 and count < 30:
-                seen[bpos] = 1
-                buf[count] = bpos
-                count += 1
-
-    return buf, count
+# [V10 移除] _find_forced_defense_moves 已删除 — 从未被任何模块调用 (死代码)
+# 其功能已被 _find_vct_defense_moves 替代
 
 
 @njit(cache=NUMBA_CACHE)

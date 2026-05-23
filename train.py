@@ -241,6 +241,9 @@ class Trainer:
                     momentum=MOMENTUM, weight_decay=WEIGHT_DECAY, nesterov=True
                 )
                 self.lr_scheduler = create_lr_scheduler(self.optimizer)
+                # V10 修复: 优化器切换后重建 swa_scheduler, 否则仍引用旧优化器
+                if USE_SWA and self.swa_model is not None:
+                    self.swa_scheduler = SWALR(self.optimizer, swa_lr=SWA_LR)
                 self._use_adamw = False
                 print("  ★ 切换优化器: AdamW → SGD")
 
@@ -400,7 +403,12 @@ class Trainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP)
             self.optimizer.step()
-            self.lr_scheduler.step()
+            # V10 修复: SWA开始后使用swa_scheduler替代cosine lr_scheduler
+            # 标准SWA做法: SWA阶段使用常数学习率, 而非继续余弦退火
+            if USE_SWA and self.swa_model is not None and self.swa_started:
+                self.swa_scheduler.step()
+            else:
+                self.lr_scheduler.step()
             self.total_steps += 1
 
             # V2: EMA 更新
@@ -428,7 +436,7 @@ class Trainer:
             'value_loss': total_v_loss / max(1, num_steps),
             'kl_reg': total_kl / max(1, num_steps),
             'total_loss': total_loss / max(1, num_steps),
-            'lr': self.lr_scheduler.get_last_lr()[0]
+            'lr': self.swa_scheduler.get_last_lr()[0] if (USE_SWA and self.swa_started) else self.lr_scheduler.get_last_lr()[0]
         }
 
     def _champion_eval(self):
@@ -547,7 +555,8 @@ class Trainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
-            'history': dict(self.history)
+            'history': dict(self.history),
+            '_use_adamw': self._use_adamw  # V10: 保存优化器类型, load时需要
         }
         if USE_SWA and self.swa_model is not None:
             data['swa_state_dict'] = self.swa_model.state_dict()
@@ -560,8 +569,22 @@ class Trainer:
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt['model_state_dict'])
-        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        self.lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
+        # V10 修复: 根据checkpoint保存时的优化器类型重建正确的优化器
+        # 否则加载SGD state到AdamW会崩溃 (param_groups结构不兼容)
+        saved_use_adamw = ckpt.get('_use_adamw', True)
+        if USE_OPTIMIZER_SWITCH and not saved_use_adamw:
+            # checkpoint保存时已经是SGD
+            self.optimizer = torch.optim.SGD(
+                self.model.parameters(), lr=LEARNING_RATE * 0.1,
+                momentum=MOMENTUM, weight_decay=WEIGHT_DECAY, nesterov=True
+            )
+            self.lr_scheduler = create_lr_scheduler(self.optimizer)
+            if USE_SWA and self.swa_model is not None:
+                self.swa_scheduler = SWALR(self.optimizer, swa_lr=SWA_LR)
+            self._use_adamw = False
+        else:
+            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            self.lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
         self.iteration = ckpt.get('iteration', 0) + 1
         self.total_steps = ckpt.get('total_steps', 0)
         self.best_elo = ckpt.get('best_elo', 0)

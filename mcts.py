@@ -347,6 +347,9 @@ class MCTS:
         # V5 修复: 使用集合跟踪待推理节点, 避免同一节点重复加入批量
         pending_node_ids = set()
 
+        # V10 修复: 记录子树复用时子节点的初始访问量, 用于提前终止判断
+        initial_child_vcs = {a: c.visit_count for a, c in root.children.items()} if root.children else {}
+
         for sim in range(num_sims):
             if USE_UNDO_MCTS:
                 # Undo-based — 不需要 copy()
@@ -489,10 +492,13 @@ class MCTS:
                     batch_boards.clear()
                     pending_node_ids.clear()
 
-            # 提前终止 — V6 修复: 先刷新批量再 break
+            # 提前终止 — V10 修复: 使用本次搜索新增的访问量, 而非总访问量
+            # 子树复用时子节点保留了上次搜索的visit_count, 直接比较会导致
+            # 搜索刚开始就触发提前终止
             if sim > num_sims // 2 and root.visit_count > 10 and root.children:
-                best_v = max(c.visit_count for c in root.children.values())
-                if best_v > sim * 0.65:
+                best_new_v = max(c.visit_count - initial_child_vcs.get(a, 0)
+                                 for a, c in root.children.items())
+                if best_new_v > (sim + 1) * 0.65:
                     if batch_features:
                         self._batch_inference(batch_features, batch_masks,
                                               batch_nodes, batch_paths, batch_boards)
@@ -885,8 +891,9 @@ class MCTS:
                     if q < q_min: q_min = q
                     if q > q_max: q_max = q
             if q_min == float('inf'):
-                q_min = FPU_VALUE if USE_FPU else 0.0
-                q_max = 0.0
+                # V10 修复: FPU_VALUE 是子节点自身视角, 取反为父节点视角
+                q_min = -FPU_VALUE if USE_FPU else 0.0
+                q_max = -FPU_VALUE if USE_FPU else 0.0
 
         best_score = -float('inf')
         best_action = -1
@@ -913,8 +920,9 @@ class MCTS:
                     if q < q_min: q_min = q
                     if q > q_max: q_max = q
             if q_min == float('inf'):
-                q_min = FPU_VALUE if USE_FPU else 0.0
-                q_max = 0.0
+                # V10 修复: FPU_VALUE 是子节点自身视角, 取反为父节点视角
+                q_min = -FPU_VALUE if USE_FPU else 0.0
+                q_max = -FPU_VALUE if USE_FPU else 0.0
 
         best_score = -float('inf')
         best_action = -1
@@ -986,11 +994,12 @@ class MCTS:
                     if psum > 0:
                         policy /= psum
 
-        # 创建子节点 — V6: original_prior 使用网络原始prior (模式注入前)
+        # 创建子节点 — V10: 确保action为Python int, 避免dict key类型不一致
         for idx in legal_indices:
-            child = self._alloc_node(parent=node, action=idx, prior=policy[idx])
-            child.original_prior = raw_policy[idx]  # V6: 保存网络原始prior
-            node.children[idx] = child
+            idx_int = int(idx)
+            child = self._alloc_node(parent=node, action=idx_int, prior=float(policy[idx]))
+            child.original_prior = float(raw_policy[idx])  # V6: 保存网络原始prior
+            node.children[idx_int] = child
 
         node.is_expanded = True
         node.sqrt_N = 0.0
