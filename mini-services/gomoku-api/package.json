@@ -1,0 +1,8 @@
+{
+  "name": "gomoku-api",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "cd /home/z/my-project && python api_server.py"
+  }
+}

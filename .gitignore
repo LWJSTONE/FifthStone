@@ -1,57 +1,78 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+local-*
+.claude
+.z-ai-config
+*.log
+dev.log
+dev.out.log
+test
+prompt
+
+server.log
+# Skills directory
+/skills/
+
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
-# Distribution / packaging
+*.egg-info/
 dist/
 build/
-*.egg-info/
 *.egg
+.eggs/
 
-# Virtual environments
-venv/
-.venv/
-env/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Model checkpoints
-*.pt
-*.pth
+# AI Training
+checkpoints/
 *.onnx
 
-# Training data
-data/
-replay_buffer/
+# Database
+db/
+*.db
 
-# Logs
-*.log
-logs/
-
-# Numba cache
-__pycache__/
-*.nbc
-*.nbi
-
-# Env and secrets
-.env
-
-# Skills (not part of this project)
-skills/
-
-# Upload directory
-upload/
-
-# Download directory (internal)
-download/
+# Project specific
+api_server.log
+.zscripts/
+mini-services/gomoku-api/node_modules/
